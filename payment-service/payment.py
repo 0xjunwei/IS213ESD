@@ -6,6 +6,7 @@ import requests
 import psycopg2
 import psycopg2.extras
 from flask import Flask, request, jsonify
+from web3 import Web3
 
 app = Flask(__name__)
 
@@ -29,6 +30,26 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "payments_pass")
 # Keccak256 hash of event log "Transfer(address,address,uint256)" from ERC20 transfers
 TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
+# handle refund
+RPC_URL = os.getenv("RPC_URL", "https://sepolia.base.org")
+REFUND_WALLET_ADDRESS = os.getenv(
+    "REFUND_WALLET_ADDRESS",
+    "0x5c6688532A27492DA6C534a37cedE11A86823152"
+)
+REFUND_PRIVATE_KEY = os.getenv("REFUND_PRIVATE_KEY", "")
+
+ERC20_ABI = [
+    {
+        "constant": False,
+        "inputs": [
+            {"name": "_to", "type": "address"},
+            {"name": "_value", "type": "uint256"}
+        ],
+        "name": "transfer",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function"
+    }
+]
 
 def get_db_connection():
     """
@@ -66,6 +87,25 @@ def init_db():
             payer_address VARCHAR(120),
             time_created TIMESTAMP NOT NULL DEFAULT NOW(),
             paid_at TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS refunds (
+            refund_id SERIAL PRIMARY KEY,
+            refund_intent_id VARCHAR(120) UNIQUE NOT NULL,
+            payment_id INT NOT NULL REFERENCES payments(payment_id),
+            hold_id VARCHAR(120) NOT NULL,
+            amount NUMERIC(18,6) NOT NULL,
+            currency VARCHAR(10) NOT NULL DEFAULT 'SGD',
+            status VARCHAR(20) NOT NULL,
+            refund_txn_id VARCHAR(120),
+            refunded_to_address VARCHAR(120),
+            refund_reason VARCHAR(255),
+            time_created TIMESTAMP NOT NULL DEFAULT NOW(),
+            refunded_at TIMESTAMP,
             updated_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         """
@@ -277,6 +317,155 @@ def mark_payment_failed(intent_id):
     conn.close()
 
 
+# Refund Helpers
+def get_latest_paid_stablecoin_payment_by_hold(hold_id):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        """
+        SELECT *
+        FROM payments
+        WHERE hold_id = %s
+          AND payment_method = 'STABLECOIN'
+          AND status = 'PAID'
+        ORDER BY paid_at DESC NULLS LAST, payment_id DESC
+        LIMIT 1
+        """,
+        (hold_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+
+def get_total_paid_refunds_for_payment(payment_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(amount), 0)
+        FROM refunds
+        WHERE payment_id = %s
+          AND status = 'PAID'
+        """,
+        (payment_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return Decimal(str(row[0] or 0))
+
+
+def create_refund_record(
+    refund_intent_id,
+    payment_id,
+    hold_id,
+    amount,
+    status,
+    refunded_to_address,
+    refund_reason,
+    refund_txn_id=None
+):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO refunds (
+            refund_intent_id, payment_id, hold_id, amount, currency,
+            status, refund_txn_id, refunded_to_address, refund_reason
+        )
+        VALUES (%s, %s, %s, %s, 'SGD', %s, %s, %s, %s)
+        """,
+        (
+            refund_intent_id,
+            payment_id,
+            hold_id,
+            amount,
+            status,
+            refund_txn_id,
+            refunded_to_address,
+            refund_reason,
+        ),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def mark_refund_paid(refund_intent_id, refund_txn_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE refunds
+        SET status = 'PAID',
+            refund_txn_id = %s,
+            refunded_at = NOW(),
+            updated_at = NOW()
+        WHERE refund_intent_id = %s
+        """,
+        (refund_txn_id, refund_intent_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def mark_refund_failed(refund_intent_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE refunds
+        SET status = 'FAILED',
+            updated_at = NOW()
+        WHERE refund_intent_id = %s
+        """,
+        (refund_intent_id,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def send_token_refund(to_address, amount_decimal):
+    if not REFUND_PRIVATE_KEY:
+        raise Exception("REFUND_PRIVATE_KEY not configured")
+
+    w3 = Web3(Web3.HTTPProvider(RPC_URL))
+    if not w3.is_connected():
+        raise Exception("RPC connection failed")
+
+    token = w3.eth.contract(
+        address=Web3.to_checksum_address(TOKEN_CONTRACT),
+        abi=ERC20_ABI
+    )
+
+    sender = Web3.to_checksum_address(REFUND_WALLET_ADDRESS)
+    recipient = Web3.to_checksum_address(to_address)
+
+    refund_units = amount_to_base_units(amount_decimal)
+    nonce = w3.eth.get_transaction_count(sender)
+
+    tx = token.functions.transfer(
+        recipient,
+        refund_units
+    ).build_transaction(
+        {
+            "from": sender,
+            "nonce": nonce,
+            "chainId": int(CHAIN_ID),
+            "gas": 100000,
+            "gasPrice": w3.eth.gas_price,
+        }
+    )
+
+    signed = w3.eth.account.sign_transaction(tx, private_key=REFUND_PRIVATE_KEY)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+
+    return w3.to_hex(tx_hash)
+
 @app.post("/payments/settle-card")
 def settle_card():
     """
@@ -393,21 +582,21 @@ def settle_agent_payment():
     tx_hash = (data.get("tx_hash") or "").strip()
 
     if not intent_id or not tx_hash:
-        return jsonify(status="FAILED"), 400
+        return jsonify(status="FAILED due to missing intent_id or tx_hash"), 400
 
     payment = get_payment_by_intent(intent_id)
     if not payment:
-        return jsonify(status="FAILED"), 400
+        return jsonify(status="FAILED due to intent not found"), 400
 
     if payment["status"] == "PAID":
         stored_tx = payment.get("txn_id")
         if stored_tx and stored_tx != tx_hash:
-            return jsonify(status="FAILED"), 400
+            return jsonify(status="FAILED due to mismatched transaction hash"), 400
         return jsonify(status="PAID"), 200
 
     expected_amount = payment.get("amount")
     if not expected_amount:
-        return jsonify(status="FAILED"), 400
+        return jsonify(status="FAILED due to missing expected amount"), 400
 
     expected_units = amount_to_base_units(expected_amount)
     pay_to = PAY_TO_ADDRESS.lower()
@@ -417,7 +606,7 @@ def settle_agent_payment():
         receipt = (get_tx_receipt(tx_hash) or {}).get("result")
         if not receipt or receipt.get("status") != "0x1":
             mark_payment_failed(intent_id)
-            return jsonify(status="FAILED"), 400
+            return jsonify(status="FAILED due to invalid transaction receipt"), 400
 
         logs = receipt.get("logs") or []
         matched = False
@@ -455,19 +644,91 @@ def settle_agent_payment():
 
         if not matched or block_ts is None:
             mark_payment_failed(intent_id)
-            return jsonify(status="FAILED"), 400
+            return jsonify(status="FAILED due to unmatched transaction"), 400
 
         created_ts = int(payment["time_created"].timestamp())
         if block_ts < created_ts or block_ts - created_ts > TIME_WINDOW_SECONDS:
             mark_payment_failed(intent_id)
-            return jsonify(status="FAILED"), 400
+            return jsonify(status="FAILED due to timestamp out of window"), 400
 
     except Exception:
         mark_payment_failed(intent_id)
-        return jsonify(status="FAILED"), 400
+        return jsonify(status="FAILED due to exception"), 400
 
     mark_payment_paid(intent_id, txn_id=tx_hash, payer_address=payer_address)
     return jsonify(status="PAID", method="TX_HASH_PROOF"), 200
+
+
+@app.post("/payments/refund")
+def refund_payment():
+    """
+    Refund latest paid stablecoin payment for a holdId back to payer_address.
+    Prevent over-refunding by checking total refunded amount first.
+    """
+    if request.content_type != "application/json":
+        return jsonify(error="Content-Type must be application/json"), 415
+
+    data = request.get_json(silent=True) or {}
+    hold_id = (data.get("holdId") or "").strip()
+    refund_amount = data.get("amount")
+    refund_reason = (data.get("reason") or "BOOKING_CANCELLED").strip()
+
+    if not hold_id or refund_amount is None:
+        return jsonify(status="FAILED", error="holdId and amount are required"), 400
+
+    refund_amount = parse_amount(refund_amount)
+    if refund_amount is None or refund_amount <= 0:
+        return jsonify(status="FAILED", error="invalid refund amount"), 400
+
+    payment = get_latest_paid_stablecoin_payment_by_hold(hold_id)
+    if not payment:
+        return jsonify(status="FAILED", error="no paid stablecoin payment found"), 404
+
+    payer_address = payment.get("payer_address")
+    if not payer_address:
+        return jsonify(status="FAILED", error="payer_address not found"), 400
+
+    original_amount = Decimal(str(payment["amount"]))
+    total_refunded = get_total_paid_refunds_for_payment(payment["payment_id"])
+    remaining_refundable = original_amount - total_refunded
+
+    if remaining_refundable <= 0:
+        return jsonify(status="FAILED", error="payment already fully refunded"), 400
+
+    if refund_amount > remaining_refundable:
+        return jsonify(
+            status="FAILED",
+            error="refund exceeds remaining refundable amount",
+        ), 400
+
+    refund_intent_id = "refund_" + str(hold_id) + "_" + str(int(time.time() * 1000))
+
+    create_refund_record(
+        refund_intent_id=refund_intent_id,
+        payment_id=payment["payment_id"],
+        hold_id=hold_id,
+        amount=str(refund_amount),
+        status="PENDING",
+        refunded_to_address=payer_address,
+        refund_reason=refund_reason,
+    )
+
+    try:
+        refund_txn_id = send_token_refund(payer_address, refund_amount)
+        mark_refund_paid(refund_intent_id, refund_txn_id)
+    except Exception as e:
+        mark_refund_failed(refund_intent_id)
+        return jsonify(status="FAILED", error=str(e)), 400
+
+    return jsonify(
+        status="PAID",
+        refundIntentId=refund_intent_id,
+        refundTxnId=refund_txn_id,
+        refundedTo=payer_address,
+        holdId=hold_id,
+        amount=str(refund_amount),
+        remainingRefundable=str(remaining_refundable - refund_amount),
+    ), 200
 
 
 @app.get("/payments/<intent_id>")
