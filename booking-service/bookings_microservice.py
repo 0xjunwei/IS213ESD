@@ -93,6 +93,7 @@ def create_booking():
             "customerEmail",
             "customerMobile",
             "checkIn",
+            "amountSpent"
             "checkOut",
         ]
 
@@ -108,8 +109,8 @@ def create_booking():
 
         insert_sql = """
         INSERT INTO bookings
-        (id, room_id, room_type, customer_email, customer_mobile, check_in, check_out,amount_spent, hold_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        (id, room_id, room_type, customer_email, customer_mobile, check_in, check_out, amount_spent, hold_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
 
         values = (
@@ -266,3 +267,6 @@ def update_booking():
 
     except Error as e:
         return jsonify({"message": "Failed to update booking", "error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
