@@ -98,6 +98,7 @@ def init_db():
             refund_intent_id VARCHAR(120) UNIQUE NOT NULL,
             payment_id INT NOT NULL REFERENCES payments(payment_id),
             hold_id VARCHAR(120) NOT NULL,
+            refund_method VARCHAR(20) NOT NULL,
             amount NUMERIC(18,6) NOT NULL,
             currency VARCHAR(10) NOT NULL DEFAULT 'SGD',
             status VARCHAR(20) NOT NULL,
@@ -108,6 +109,20 @@ def init_db():
             refunded_at TIMESTAMP,
             updated_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_refunds_payment_id
+        ON refunds(payment_id);
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_refunds_hold_id
+        ON refunds(hold_id);
         """
     )
     conn.commit()
@@ -318,7 +333,7 @@ def mark_payment_failed(intent_id):
 
 
 # Refund Helpers
-def get_latest_paid_stablecoin_payment_by_hold(hold_id):
+def get_latest_paid_payment_by_hold(hold_id):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
@@ -326,7 +341,6 @@ def get_latest_paid_stablecoin_payment_by_hold(hold_id):
         SELECT *
         FROM payments
         WHERE hold_id = %s
-          AND payment_method = 'STABLECOIN'
           AND status = 'PAID'
         ORDER BY paid_at DESC NULLS LAST, payment_id DESC
         LIMIT 1
@@ -361,6 +375,7 @@ def create_refund_record(
     refund_intent_id,
     payment_id,
     hold_id,
+    refund_method,
     amount,
     status,
     refunded_to_address,
@@ -369,25 +384,36 @@ def create_refund_record(
 ):
     conn = get_db_connection()
     cur = conn.cursor()
+
     cur.execute(
         """
         INSERT INTO refunds (
-            refund_intent_id, payment_id, hold_id, amount, currency,
-            status, refund_txn_id, refunded_to_address, refund_reason
+            refund_intent_id,
+            payment_id,
+            hold_id,
+            refund_method,
+            amount,
+            currency,
+            status,
+            refund_txn_id,
+            refunded_to_address,
+            refund_reason
         )
-        VALUES (%s, %s, %s, %s, 'SGD', %s, %s, %s, %s)
+        VALUES (%s,%s,%s,%s,%s,'SGD',%s,%s,%s,%s)
         """,
         (
             refund_intent_id,
             payment_id,
             hold_id,
+            refund_method,
             amount,
             status,
             refund_txn_id,
             refunded_to_address,
-            refund_reason,
+            refund_reason
         ),
     )
+
     conn.commit()
     cur.close()
     conn.close()
@@ -396,17 +422,19 @@ def create_refund_record(
 def mark_refund_paid(refund_intent_id, refund_txn_id):
     conn = get_db_connection()
     cur = conn.cursor()
+
     cur.execute(
         """
         UPDATE refunds
-        SET status = 'PAID',
-            refund_txn_id = %s,
-            refunded_at = NOW(),
-            updated_at = NOW()
-        WHERE refund_intent_id = %s
+        SET status='PAID',
+            refund_txn_id=%s,
+            refunded_at=NOW(),
+            updated_at=NOW()
+        WHERE refund_intent_id=%s
         """,
         (refund_txn_id, refund_intent_id),
     )
+
     conn.commit()
     cur.close()
     conn.close()
@@ -662,7 +690,9 @@ def settle_agent_payment():
 @app.post("/payments/refund")
 def refund_payment():
     """
-    Refund latest paid stablecoin payment for a holdId back to payer_address.
+    Refund latest paid payment for a holdId.
+    - STABLECOIN: real token transfer back to payer_address
+    - CARD_LUHN: simulated refund, recorded in DB
     Prevent over-refunding by checking total refunded amount first.
     """
     if request.content_type != "application/json":
@@ -680,13 +710,9 @@ def refund_payment():
     if refund_amount is None or refund_amount <= 0:
         return jsonify(status="FAILED", error="invalid refund amount"), 400
 
-    payment = get_latest_paid_stablecoin_payment_by_hold(hold_id)
+    payment = get_latest_paid_payment_by_hold(hold_id)
     if not payment:
-        return jsonify(status="FAILED", error="no paid stablecoin payment found"), 404
-
-    payer_address = payment.get("payer_address")
-    if not payer_address:
-        return jsonify(status="FAILED", error="payer_address not found"), 400
+        return jsonify(status="FAILED", error="no paid payment found"), 404
 
     original_amount = Decimal(str(payment["amount"]))
     total_refunded = get_total_paid_refunds_for_payment(payment["payment_id"])
@@ -702,20 +728,42 @@ def refund_payment():
         ), 400
 
     refund_intent_id = "refund_" + str(hold_id) + "_" + str(int(time.time() * 1000))
+    payment_method = payment.get("payment_method")
+
+    refunded_to_address = None
+    refund_txn_id = None
+
+    if payment_method == "STABLECOIN":
+        refunded_to_address = payment.get("payer_address")
+        if not refunded_to_address:
+            return jsonify(status="FAILED", error="payer_address not found"), 400
+
+    elif payment_method == "CARD_LUHN":
+        refunded_to_address = "CARD_REFUND_SIMULATED"
+
+    else:
+        return jsonify(status="FAILED", error="unsupported payment method"), 400
 
     create_refund_record(
         refund_intent_id=refund_intent_id,
         payment_id=payment["payment_id"],
         hold_id=hold_id,
+        refund_method=payment_method,
         amount=str(refund_amount),
         status="PENDING",
-        refunded_to_address=payer_address,
+        refunded_to_address=refunded_to_address,
         refund_reason=refund_reason,
     )
 
     try:
-        refund_txn_id = send_token_refund(payer_address, refund_amount)
+        if payment_method == "STABLECOIN":
+            refund_txn_id = send_token_refund(refunded_to_address, refund_amount)
+
+        elif payment_method == "CARD_LUHN":
+            refund_txn_id = "card_refund_" + str(int(time.time() * 1000))
+
         mark_refund_paid(refund_intent_id, refund_txn_id)
+
     except Exception as e:
         mark_refund_failed(refund_intent_id)
         return jsonify(status="FAILED", error=str(e)), 400
@@ -724,9 +772,10 @@ def refund_payment():
         status="PAID",
         refundIntentId=refund_intent_id,
         refundTxnId=refund_txn_id,
-        refundedTo=payer_address,
+        refundedTo=refunded_to_address,
         holdId=hold_id,
         amount=str(refund_amount),
+        paymentMethod=payment_method,
         remainingRefundable=str(remaining_refundable - refund_amount),
     ), 200
 
