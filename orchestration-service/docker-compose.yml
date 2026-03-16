@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orchestrator
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()\""]
+      interval: 10s
+      timeout: 3s
+      retries: 5
