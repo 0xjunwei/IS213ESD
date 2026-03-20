@@ -82,9 +82,14 @@ def create_hold():
     data = request.get_json()
 
     room_type = data.get("roomType")
+    check_in = data.get("checkIn")
+    check_out = data.get("checkOut")
 
-    if not room_type:
-        return jsonify({"error": "roomType required"}), 400
+    # if not room_type:
+    #     return jsonify({"error": "roomType required"}), 400
+    
+    if not room_type or not check_in or not check_out:
+        return jsonify({"error": "roomType, checkIn and checkOut are required"}), 400
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
@@ -94,17 +99,33 @@ def create_hold():
         # EXPIRED HOLD CHECKS DONE WHENEVER SOMEONE CALLS THIS
         cursor.execute("""
         UPDATE rooms
-        SET status = 'available', holdId = NULL, holdExpiry = NULL
+        SET status = 'available',
+            holdId = NULL,
+            holdExpiry = NULL,
+            checkIn = NULL,
+            checkOut = NULL
         WHERE status = 'held' AND holdExpiry < NOW()
         """)
         conn.commit()
         
         # 1. find available room
         cursor.execute("""
-            SELECT * FROM rooms
-            WHERE roomType = %s AND status = 'available'
-            LIMIT 1
-        """, (room_type,))
+        SELECT * FROM rooms
+        WHERE roomType = %s
+        AND (
+                status = 'available'
+                OR (
+                    status = 'held' AND holdExpiry < NOW()
+                )
+            )
+        AND (
+                checkIn IS NULL
+                OR checkOut IS NULL
+                OR checkOut <= %s
+                OR checkIn >= %s
+            )
+        LIMIT 1
+        """, (room_type, check_in, check_out))
 
         room = cursor.fetchone()
 
@@ -116,22 +137,35 @@ def create_hold():
 
         # 3. set expiry (5 minutes)
         expiry_time = datetime.now() + timedelta(minutes=5)
+        check_in_date = datetime.strptime(check_in, "%Y-%m-%d")
+        check_out_date = datetime.strptime(check_out, "%Y-%m-%d")
+        nights = (check_out_date - check_in_date).days
+
+        if nights <= 0:
+            return jsonify({"error": "checkOut must be after checkIn"}), 400
+
+        cost = nights * 100
 
         # 4. update room
         cursor.execute("""
-            UPDATE rooms
-            SET status = 'held',
-                holdId = %s,
-                holdExpiry = %s
-            WHERE roomID = %s
-        """, (hold_id, expiry_time, room["roomID"]))
+        UPDATE rooms
+        SET status = 'held',
+            holdId = %s,
+            holdExpiry = %s,
+            checkIn = %s,
+            checkOut = %s
+        WHERE roomID = %s
+        """, (hold_id, expiry_time, check_in, check_out, room["roomID"]))
 
         conn.commit()
 
         return jsonify({
             "roomID": room["roomID"],
             "holdId": hold_id,
-            "amount": room["costForTonight"],
+            "roomType": room_type,
+            "checkIn": check_in,
+            "checkOut": check_out,
+            "amount": cost,
             "timeToExpire": expiry_time.strftime("%Y-%m-%d %H:%M:%S")
         })
 
