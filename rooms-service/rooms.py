@@ -209,12 +209,13 @@ def update_room():
             conn.close()
             return jsonify({"message": "Room not found for given holdId"}), 404
 
-        update_fields = []
-        values = []
+        if not status:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Missing field: status"}), 400
 
-        if status is not None:
-            update_fields.append("status = %s")
-            values.append(status)
+        update_fields = ["status = %s"]
+        values = [status]
 
         if booking_id is not None:
             update_fields.append("bookingId = %s")
@@ -224,10 +225,16 @@ def update_room():
             update_fields.append("reservationDate = %s")
             values.append(reservation_date)
 
-        if not update_fields:
-            cursor.close()
-            conn.close()
-            return jsonify({"message": "No fields provided to update"}), 400
+        if status in ("PAID", "reserved"):
+            update_fields.append("holdExpiry = NULL")
+
+        if status == "available":
+            update_fields.append("bookingId = NULL")
+            update_fields.append("reservationDate = NULL")
+            update_fields.append("holdId = NULL")
+            update_fields.append("checkIn = NULL")
+            update_fields.append("checkOut = NULL")
+            update_fields.append("holdExpiry = NULL")
 
         values.append(hold_id)
 
@@ -252,132 +259,84 @@ def update_room():
     except Exception as e:
         return jsonify({"message": "Unexpected error", "error": str(e)}), 500
 
+@app.post("/rooms/update-reservation")
+def update_reservation():
+    try:
+        data = request.get_json()
 
-# @app.post("/rooms/update")
-# def update_room():
-#     try:
-#         data = request.get_json()
+        if not data:
+            return jsonify({"message": "Missing JSON body"}), 400
 
-#         if not data:
-#             return jsonify({"message": "Missing JSON body"}), 400
+        old_hold_id = data.get("oldHoldId")
+        new_hold_id = data.get("newHoldId")
 
-#         if "roomID" not in data:
-#             return jsonify({"message": "Missing field: roomID"}), 400
+        if not old_hold_id or not new_hold_id:
+            return jsonify({"message": "oldHoldId and newHoldId are required"}), 400
 
-#         room_id = data["roomID"]
-#         room_type = data.get("roomType")
-#         cost_for_tonight = data.get("costForTonight")
-#         status = data.get("status")
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
 
-#         conn = get_connection()
-#         cursor = conn.cursor(dictionary=True)
+        # 1. Find old room
+        cursor.execute("SELECT * FROM rooms WHERE holdId = %s", (old_hold_id,))
+        old_room = cursor.fetchone()
 
-#         cursor.execute("SELECT * FROM rooms WHERE roomID = %s", (room_id,))
-#         existing_room = cursor.fetchone()
+        if not old_room:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Old room not found for given oldHoldId"}), 404
 
-#         if not existing_room:
-#             cursor.close()
-#             conn.close()
-#             return jsonify({"message": "Room not found"}), 404
+        # 2. Find new room
+        cursor.execute("SELECT * FROM rooms WHERE holdId = %s", (new_hold_id,))
+        new_room = cursor.fetchone()
 
-#         update_fields = []
-#         values = []
+        if not new_room:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "New room not found for given newHoldId"}), 404
 
-#         if room_type is not None:
-#             update_fields.append("roomType = %s")
-#             values.append(room_type)
+        # 3. Release old room
+        cursor.execute("""
+            UPDATE rooms
+            SET status = 'available',
+                holdId = NULL,
+                holdExpiry = NULL,
+                bookingId = NULL,
+                reservationDate = NULL,
+                checkIn = NULL,
+                checkOut = NULL
+            WHERE holdId = %s
+        """, (old_hold_id,))
 
-#         if cost_for_tonight is not None:
-#             update_fields.append("costForTonight = %s")
-#             values.append(cost_for_tonight)
+        # 4. Confirm new room
+        cursor.execute("""
+            UPDATE rooms
+            SET status = 'reserved',
+                holdExpiry = NULL
+            WHERE holdId = %s
+        """, (new_hold_id,))
 
-#         if status is not None:
-#             update_fields.append("status = %s")
-#             values.append(status)
+        conn.commit()
 
-#         if not update_fields:
-#             cursor.close()
-#             conn.close()
-#             return jsonify({"message": "No fields provided to update"}), 400
+        # 5. Fetch updated new room
+        cursor.execute("SELECT * FROM rooms WHERE holdId = %s", (new_hold_id,))
+        updated_new_room = cursor.fetchone()
 
-#         values.append(room_id)
+        cursor.close()
+        conn.close()
 
-#         sql = f"""
-#             UPDATE rooms
-#             SET {', '.join(update_fields)}
-#             WHERE roomID = %s
-#         """
-#         cursor.execute(sql, tuple(values))
-#         conn.commit()
+        return jsonify({
+            "message": "Reservation updated successfully",
+            "oldHoldId": old_hold_id,
+            "newHoldId": new_hold_id,
+            "newRoom": updated_new_room
+        }), 200
 
-#         cursor.execute("SELECT * FROM rooms WHERE roomID = %s", (room_id,))
-#         updated_room = cursor.fetchone()
-
-#         cursor.close()
-#         conn.close()
-
-#         return jsonify(updated_room), 200
-
-#     except Error as e:
-#         return jsonify({"message": "Database error", "error": str(e)}), 500
-#     except Exception as e:
-#         return jsonify({"message": "Unexpected error", "error": str(e)}), 500
+    except Error as e:
+        return jsonify({"message": "Database error", "error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"message": "Unexpected error", "error": str(e)}), 500
 
 
-
-# @app.post("/rooms/update-reservation")
-# def update_reservation():
-#     try:
-#         data = request.get_json()
-
-#         if not data:
-#             return jsonify({"message": "Missing JSON body"}), 400
-
-#         required_fields = ["roomID", "reservationDate", "status"]
-#         for field in required_fields:
-#             if field not in data:
-#                 return jsonify({"message": f"Missing field: {field}"}), 400
-
-#         room_id = data["roomID"]
-#         reservation_date = data["reservationDate"]
-#         status = data["status"]
-#         booking_id = data.get("bookingId")
-#         hold_id = data.get("holdId")
-
-#         conn = get_connection()
-#         cursor = conn.cursor(dictionary=True)
-
-#         cursor.execute("SELECT * FROM rooms WHERE roomID = %s", (room_id,))
-#         existing_room = cursor.fetchone()
-
-#         if not existing_room:
-#             cursor.close()
-#             conn.close()
-#             return jsonify({"message": "Room not found"}), 404
-
-#         cursor.execute("""
-#             UPDATE rooms
-#             SET reservationDate = %s,
-#                 status = %s,
-#                 bookingId = %s,
-#                 holdId = %s
-#             WHERE roomID = %s
-#         """, (reservation_date, status, booking_id, hold_id, room_id))
-
-#         conn.commit()
-
-#         cursor.execute("SELECT * FROM rooms WHERE roomID = %s", (room_id,))
-#         updated_room = cursor.fetchone()
-
-#         cursor.close()
-#         conn.close()
-
-#         return jsonify(updated_room), 200
-
-#     except Error as e:
-#         return jsonify({"message": "Database error", "error": str(e)}), 500
-#     except Exception as e:
-#         return jsonify({"message": "Unexpected error", "error": str(e)}), 500
     
 
 # ================================ ENDPOINT END ================================ #
