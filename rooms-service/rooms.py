@@ -158,11 +158,16 @@ def create_hold():
         """, (hold_id, expiry_time, check_in, check_out, room["roomID"]))
 
         conn.commit()
+        
+        #Idk if the next 3 lines are a waste of resources, it's meant to fetch status dynamically, even though we are p sure it's "held"
+        cursor.execute("SELECT status FROM rooms WHERE roomID = %s", (room["roomID"],))
+        updated_room = cursor.fetchone()
 
         return jsonify({
             "roomID": room["roomID"],
             "holdId": hold_id,
             "roomType": room_type,
+            "status": updated_room["status"],
             "checkIn": check_in,
             "checkOut": check_out,
             "amount": cost,
