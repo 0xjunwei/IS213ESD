@@ -9,6 +9,8 @@ from loyalty.services.loyalty_service import send_to_outsystems
 # =========================
 
 STREAM_NAME = "booking_stream"
+DEAD_LETTER_STREAM = "dead_letter_stream"
+
 GROUP_NAME = "loyalty_group"
 CONSUMER_NAME = "consumer-1"
 
@@ -29,7 +31,7 @@ def create_consumer_group():
         redis_client.xgroup_create(
             name=STREAM_NAME,
             groupname=GROUP_NAME,
-            id="0",  # read from beginning (use "$" if only new messages)
+            id="0",  # use "$" if you only want new messages
             mkstream=True,
         )
         print("✅ Consumer group created")
@@ -71,7 +73,20 @@ def consume_messages():
 
                         except Exception as e:
                             print("❌ Processing failed:", e)
-                            # ❗ no ACK → message will be retried
+
+                            # 🚨 SEND TO DEAD LETTER STREAM
+                            redis_client.xadd(
+                                DEAD_LETTER_STREAM,
+                                {
+                                    "original_id": message_id,
+                                    "data": json.dumps(raw_data),
+                                    "error": str(e),
+                                },
+                            )
+
+                            print(f"📦 Sent to dead_letter_stream: {message_id}")
+
+                            # ❗ DO NOT ACK → allows retry via consumer group
 
             else:
                 print("⏳ No new messages...")
@@ -98,6 +113,9 @@ def process_event(raw_data):
 
         event_type = data.get("event")
 
+        if not event_type:
+            raise ValueError("Missing event type")
+
         if event_type == "booking_paid":
             handle_booking_paid(data)
 
@@ -108,11 +126,11 @@ def process_event(raw_data):
             handle_booking_modified(data)
 
         else:
-            print(f"⚠️ Unknown event type: {event_type}")
+            raise ValueError(f"Unknown event type: {event_type}")
 
     except Exception as e:
         print("❌ Error processing event:", e)
-        raise e  # 🔥 VERY IMPORTANT for retry
+        raise e  # 🔥 MUST re-raise for dead letter + retry
 
 
 # =========================
@@ -121,44 +139,68 @@ def process_event(raw_data):
 
 
 def handle_booking_paid(data):
-    email = data.get("email")
-    booking_id = data.get("bookingId")
-    amount = int(data.get("amount", 0))
+    try:
+        email = data.get("email")
+        booking_id = data.get("bookingId")
+        amount = int(data.get("amount", 0))
 
-    points = amount // 10
+        if not email:
+            raise ValueError("Missing email")
 
-    print("➡️ Processing booking_paid")
-    print("📤 Calling OutSystems...")
+        points = amount // 10
 
-    send_to_outsystems(email, booking_id, amount, points)
+        print("➡️ Processing booking_paid")
+        print("📤 Calling OutSystems...")
+
+        send_to_outsystems(email, booking_id, amount, points)
+
+    except Exception as e:
+        print("❌ Failed in booking_paid:", e)
+        raise e
 
 
 def handle_booking_cancelled(data):
-    email = data.get("email")
-    booking_id = data.get("bookingId")
-    amount = int(data.get("amount", 0))
+    try:
+        email = data.get("email")
+        booking_id = data.get("bookingId")
+        amount = int(data.get("amount", 0))
 
-    points = -(amount // 10)  # negative points
+        if not email:
+            raise ValueError("Missing email")
 
-    print("➡️ Processing booking_cancelled")
-    print("📤 Calling OutSystems...")
+        points = -(amount // 10)
 
-    send_to_outsystems(email, booking_id, amount, points)
+        print("➡️ Processing booking_cancelled")
+        print("📤 Calling OutSystems...")
+
+        send_to_outsystems(email, booking_id, amount, points)
+
+    except Exception as e:
+        print("❌ Failed in booking_cancelled:", e)
+        raise e
 
 
 def handle_booking_modified(data):
-    email = data.get("email")
-    booking_id = data.get("bookingId")
+    try:
+        email = data.get("email")
+        booking_id = data.get("bookingId")
 
-    old_amount = int(data.get("old_amount", 0))
-    new_amount = int(data.get("new_amount", 0))
+        old_amount = int(data.get("old_amount", 0))
+        new_amount = int(data.get("new_amount", 0))
 
-    diff = (new_amount // 10) - (old_amount // 10)
+        if not email:
+            raise ValueError("Missing email")
 
-    print("➡️ Processing booking_modified")
-    print("📤 Calling OutSystems...")
+        diff = (new_amount // 10) - (old_amount // 10)
 
-    send_to_outsystems(email, booking_id, new_amount, diff)
+        print("➡️ Processing booking_modified")
+        print("📤 Calling OutSystems...")
+
+        send_to_outsystems(email, booking_id, new_amount, diff)
+
+    except Exception as e:
+        print("❌ Failed in booking_modified:", e)
+        raise e
 
 
 # =========================
