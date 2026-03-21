@@ -21,7 +21,7 @@ TOKEN_DECIMALS = int(os.getenv("TOKEN_DECIMALS", "6"))
 
 TIME_WINDOW_SECONDS = int(os.getenv("TIME_WINDOW_SECONDS", "3600"))
 
-DB_HOST = os.getenv("DB_HOST", "postgres")
+DB_HOST = os.getenv("DB_HOST", "payments-postgres")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME", "payments_db")
 DB_USER = os.getenv("DB_USER", "payments_user")
