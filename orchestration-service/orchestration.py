@@ -1,6 +1,8 @@
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import redis
 import requests
@@ -15,6 +17,7 @@ paymentService = os.getenv("PAYMENT_SERVICE", "http://payment-service:5002")
 bookingsService = os.getenv("BOOKINGS_SERVICE", "http://bookings-service:5000")
 roomsService = os.getenv("ROOMS_SERVICE", "http://rooms-service:5003")
 forwardTimeout = float(os.getenv("FORWARD_TIMEOUT", "8"))
+bookingNightlyRate = float(os.getenv("BOOKING_NIGHTLY_RATE", "100"))
 
 redisHost = os.getenv("REDIS_HOST", "localhost")
 redisPort = int(os.getenv("REDIS_PORT", "6379"))
@@ -271,6 +274,90 @@ def routeBookingsUpdate():
     if unauthorized:
         return unauthorized
     return forward("POST", f"{bookingsService}/bookings/update")
+
+
+@app.get("/route-rooms/options")
+def routeRoomsOptions():
+    """
+    Return room type options and indicative costs for conversational clients.
+    """
+    try:
+        upstream = requests.get(
+            f"{roomsService}/rooms",
+            timeout=forwardTimeout,
+        )
+    except requests.Timeout:
+        return jsonify({"error": "Rooms service timeout"}), 504
+    except requests.ConnectionError:
+        return jsonify({"error": "Rooms service unavailable"}), 502
+
+    try:
+        rooms_data = upstream.json()
+    except ValueError:
+        return jsonify({"error": "Invalid response from rooms service"}), 502
+
+    if upstream.status_code >= 400:
+        return jsonify(rooms_data), upstream.status_code
+
+    if not isinstance(rooms_data, list):
+        return jsonify({"error": "Unexpected room options payload"}), 502
+
+    def is_effectively_available(room):
+        status = str(room.get("status", "")).lower()
+        if status == "available":
+            return True
+        if status != "held":
+            return False
+
+        hold_expiry_raw = room.get("holdExpiry")
+        if not hold_expiry_raw:
+            return False
+
+        try:
+            expiry = parsedate_to_datetime(str(hold_expiry_raw))
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            return expiry <= datetime.now(timezone.utc)
+        except Exception:
+            return False
+
+    grouped = {}
+    for room in rooms_data:
+        room_type = room.get("roomType")
+        if not room_type:
+            continue
+
+        if room_type not in grouped:
+            grouped[room_type] = {
+                "roomType": room_type,
+                "startingCost": None,
+                "totalRooms": 0,
+                "availableRooms": 0,
+            }
+
+        grouped[room_type]["totalRooms"] += 1
+        if is_effectively_available(room):
+            grouped[room_type]["availableRooms"] += 1
+
+        raw_cost = room.get("costForTonight")
+        try:
+            cost = float(raw_cost)
+            current = grouped[room_type]["startingCost"]
+            if current is None or cost < current:
+                grouped[room_type]["startingCost"] = cost
+        except (TypeError, ValueError):
+            continue
+
+    options = sorted(grouped.values(), key=lambda item: item["roomType"])
+
+    # Current booking flow charges a flat nightly rate in rooms hold computation.
+    for item in options:
+        item["startingCost"] = bookingNightlyRate
+
+    return jsonify({
+        "currency": "SGD",
+        "roomOptions": options,
+    }), 200
 
 
 # Scenario 1 Initial Step for booking a room: create hold and payment intent
