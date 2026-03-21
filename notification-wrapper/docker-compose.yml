@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+
+  resend-wrapper:
+    build: .
+    container_name: resend-wrapper
+    env_file:
+      - .env
+    depends_on:
+      - redis

@@ -1,0 +1,8 @@
+REDIS_HOST=redis
+REDIS_PORT=6379
+STREAM_NAME=email_stream
+GROUP_NAME=email_group
+CONSUMER_NAME=consumer_1
+
+RESEND_API_KEY=re_LCQKD47r_6S2Bpoxk5iAuWwHcbiR3sWms
+RESEND_FROM_EMAIL=onboarding@resend.dev
