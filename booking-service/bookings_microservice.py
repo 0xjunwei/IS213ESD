@@ -93,7 +93,7 @@ def create_booking():
             "customerEmail",
             "customerMobile",
             "checkIn",
-            "amountSpent"
+            "amountSpent",
             "checkOut",
         ]
 
