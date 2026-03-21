@@ -2,7 +2,7 @@ import redis
 import time
 import json
 
-from loyalty.services.loyalty_service import send_to_outsystems
+from services.loyalty_service import send_to_outsystems
 
 # =========================
 # CONFIG
@@ -16,7 +16,7 @@ CONSUMER_NAME = "consumer-1"
 
 # Redis connection
 redis_client = redis.Redis(
-    host="localhost",  # change to "redis" if using Docker
+    host="redis",  # change to "redis" if using Docker
     port=6379,
     decode_responses=True,
 )
@@ -45,11 +45,11 @@ def create_consumer_group():
 
 
 def consume_messages():
-    print("🚀 Loyalty consumer started...")
+    print("🚀 Loyalty consumer started...", flush=True)
 
     try:
         while True:
-            print("📡 Polling Redis...")
+            print("📡 Polling Redis...", flush=True)
 
             messages = redis_client.xreadgroup(
                 groupname=GROUP_NAME,

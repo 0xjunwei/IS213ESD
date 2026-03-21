@@ -1,0 +1,12 @@
+services:
+  redis:
+    image: redis:7
+    container_name: redis
+
+  consumer:
+    build: .
+    command: python -u -m consumers.consumer
+    environment:
+      - PYTHONPATH=/app
+    depends_on:
+      - redis
