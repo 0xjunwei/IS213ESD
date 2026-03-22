@@ -1,5 +1,6 @@
 import os
 import time
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -21,7 +22,7 @@ bookingNightlyRate = float(os.getenv("BOOKING_NIGHTLY_RATE", "100"))
 
 redisHost = os.getenv("REDIS_HOST", "localhost")
 redisPort = int(os.getenv("REDIS_PORT", "6379"))
-redisStream = os.getenv("LOYALTY_STREAM", "booking_events")
+redisStream = os.getenv("LOYALTY_STREAM", "booking_stream")
 
 # In-memory sessions: token -> user
 sessions = {}
@@ -587,18 +588,23 @@ def routeRoomsConfirmBooking():
             "error": "Finalize step failed after payment settlement",
         }), 502
 
+    loyalty_publish_error = None
     try:
-        points = int(float(booking_payload["amountSpent"])) // 10
+        amount_for_loyalty = int(float(booking_payload["amountSpent"]))
+        points = amount_for_loyalty // 10
+        loyalty_event = {
+            "event": "booking_paid",
+            "email": booking_payload["customerEmail"],
+            "bookingId": str(booking_id),
+            "amount": amount_for_loyalty,
+        }
         redis_client.xadd(
             redisStream,
-            {
-                "event": "add_points",
-                "email": booking_payload["customerEmail"],
-                "points": str(points),
-            },
+            {"data": json.dumps(loyalty_event)},
         )
-    except Exception:
+    except Exception as exc:
         points = None
+        loyalty_publish_error = str(exc)
 
     pendingBookings.pop(intent_id, None)
 
@@ -608,9 +614,10 @@ def routeRoomsConfirmBooking():
         "booking": bookings_data,
         "room": rooms_data,
         "loyalty": {
-            "event": "add_points",
+            "event": "booking_paid",
             "email": booking_payload["customerEmail"],
             "points": points,
+            "publishError": loyalty_publish_error,
         },
     }), 200
 

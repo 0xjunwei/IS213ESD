@@ -3,6 +3,7 @@ import os
 import re
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
@@ -48,6 +49,7 @@ class SessionState:
 	awaiting_payment_confirm: bool = False
 	payment_info: Dict[str, Any] = field(default_factory=dict)
 	private_key: Optional[str] = None
+	party_size: Optional[int] = None
 
 
 sessions: Dict[int, SessionState] = {}
@@ -70,6 +72,7 @@ def clear_booking_flow(state: SessionState) -> None:
 	state.collecting = False
 	state.awaiting_payment_confirm = False
 	state.payment_info = {}
+	state.party_size = None
 
 
 def parse_json_text(raw: str) -> Dict[str, Any]:
@@ -87,6 +90,19 @@ def fallback_extract_slots(text: str) -> Dict[str, str]:
 	if len(date_matches) >= 2:
 		extracted["checkOut"] = date_matches[1]
 
+	if "checkIn" not in extracted or "checkOut" not in extracted:
+		natural_date_pattern = (
+			r"(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4}|"
+			r"[A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s*\d{4})"
+		)
+		natural_dates = re.findall(natural_date_pattern, text, flags=re.IGNORECASE)
+		parsed_dates = [normalize_date_string(item) for item in natural_dates]
+		parsed_dates = [item for item in parsed_dates if item]
+		if len(parsed_dates) >= 1 and "checkIn" not in extracted:
+			extracted["checkIn"] = parsed_dates[0]
+		if len(parsed_dates) >= 2 and "checkOut" not in extracted:
+			extracted["checkOut"] = parsed_dates[1]
+
 	email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
 	if email_match:
 		extracted["customerEmail"] = email_match.group(0)
@@ -95,16 +111,136 @@ def fallback_extract_slots(text: str) -> Dict[str, str]:
 	if mobile_match:
 		extracted["customerMobile"] = mobile_match.group(0)
 
-	room_match = re.search(r"\b(Standard|Deluxe|Suite|Single|Double)\b", text, re.IGNORECASE)
+	room_match = re.search(
+		r"\b(Standard|Deluxe|Suite|Single|Double|single room|double room)\b",
+		text,
+		re.IGNORECASE,
+	)
 	if room_match:
-		extracted["roomType"] = room_match.group(1)
+		extracted["roomType"] = normalize_room_type(room_match.group(1))
 
 	return extracted
 
 
+def normalize_date_string(raw: str) -> Optional[str]:
+	cleaned = raw.strip().lower()
+	cleaned = re.sub(r"(\d)(st|nd|rd|th)", r"\1", cleaned)
+	cleaned = cleaned.replace(",", " ")
+	cleaned = re.sub(r"\s+", " ", cleaned)
+
+	for fmt in ("%d %B %Y", "%d %b %Y", "%B %d %Y", "%b %d %Y"):
+		try:
+			parsed = datetime.strptime(cleaned, fmt)
+			return parsed.strftime("%Y-%m-%d")
+		except ValueError:
+			continue
+	return None
+
+
+def normalize_room_type(raw: str) -> str:
+	mapped = {
+		"single": "Standard",
+		"single room": "Standard",
+		"double": "Deluxe",
+		"double room": "Deluxe",
+		"standard": "Standard",
+		"deluxe": "Deluxe",
+		"suite": "Suite",
+	}
+	return mapped.get(raw.strip().lower(), raw.strip().title())
+
+
+def detect_booking_intent(text: str) -> bool:
+	return bool(
+		re.search(
+			r"\b(book|booking|reserve|reservation|room)\b",
+			text,
+			re.IGNORECASE,
+		)
+	)
+
+
+def extract_party_size(text: str) -> Optional[int]:
+	match = re.search(r"\b(\d{1,2})\s*(person|persons|people|guest|guests|pax)\b", text, re.IGNORECASE)
+	if not match:
+		return None
+	try:
+		return int(match.group(1))
+	except ValueError:
+		return None
+
+
+def format_date_human(raw_date: Any) -> str:
+	if raw_date is None:
+		return "N/A"
+	text = str(raw_date)
+	for fmt in ("%Y-%m-%d", "%a, %d %b %Y %H:%M:%S GMT"):
+		try:
+			parsed = datetime.strptime(text, fmt)
+			return parsed.strftime("%d %b %Y")
+		except ValueError:
+			continue
+	return text
+
+
+def format_book_intent_success_message(book_payload: Dict[str, Any], book_data: Dict[str, Any], party_size: Optional[int]) -> str:
+	amount = book_data.get("amount")
+	network = book_data.get("network", "unknown")
+	party_text = f" for {party_size} guest(s)" if party_size else ""
+	return (
+		"Great, I found a room and created your payment request.\n\n"
+		f"Room: {book_payload.get('roomType')}\n"
+		f"Stay: {format_date_human(book_payload.get('checkIn'))} to {format_date_human(book_payload.get('checkOut'))}{party_text}\n"
+		f"Amount: {amount}\n"
+		f"Network: {network}\n\n"
+		"When you're ready, reply PAY and I'll send the payment transaction and finalize your booking."
+	)
+
+
+def format_book_intent_failure_message(status_code: int, data: Dict[str, Any]) -> str:
+	error = str(data.get("error") or data.get("message") or "Unknown error")
+	if status_code == 404 and "No available room" in error:
+		return (
+			"I couldn't find an available room for those dates and room type. "
+			"Try a different room type or adjust the dates, and I'll check again."
+		)
+	if status_code == 502:
+		return "I couldn't reach one of our booking systems just now. Please try again in a moment."
+	return f"I couldn't create the booking request yet ({status_code}): {error}."
+
+
+def format_confirm_success_message(confirm_data: Dict[str, Any], tx_hash: str) -> str:
+	booking = confirm_data.get("booking", {}) if isinstance(confirm_data, dict) else {}
+	room = confirm_data.get("room", {}) if isinstance(confirm_data, dict) else {}
+	loyalty = confirm_data.get("loyalty", {}) if isinstance(confirm_data, dict) else {}
+
+	booking_id = booking.get("id") or room.get("bookingId") or "N/A"
+	room_type = booking.get("room_type") or room.get("roomType") or "your room"
+	check_in = booking.get("check_in") or room.get("checkIn")
+	check_out = booking.get("check_out") or room.get("checkOut")
+	points = loyalty.get("points")
+
+	lines = [
+		"Your booking is confirmed.",
+		f"Booking ID: {booking_id}",
+		f"Room: {room_type}",
+		f"Stay: {format_date_human(check_in)} to {format_date_human(check_out)}",
+		f"Transaction: {tx_hash}",
+	]
+	if points is not None:
+		lines.append(f"Loyalty: {points} points added.")
+	else:
+		lines.append("Loyalty: points update is queued and will be reflected shortly.")
+
+	return "\n".join(lines)
+
+
 def extract_slots_with_openai(text: str, current_slots: Dict[str, Optional[str]]) -> Dict[str, str]:
+	required_keys = ["roomType", "checkIn", "checkOut", "customerEmail", "customerMobile"]
+	fallback = fallback_extract_slots(text)
+
 	if not openai_client:
-		return fallback_extract_slots(text)
+		return fallback
 
 	prompt = {
 		"task": "Extract booking fields from user message.",
@@ -133,9 +269,22 @@ def extract_slots_with_openai(text: str, current_slots: Dict[str, Optional[str]]
 		)
 		raw = response.output_text.strip()
 		parsed = parse_json_text(raw)
-		return {k: v for k, v in parsed.items() if v}
+		extracted = {
+			k: v
+			for k, v in parsed.items()
+			if k in required_keys and v not in (None, "")
+		}
+
+		# If model output is malformed or empty, keep the bot reliable with regex fallback.
+		if not extracted:
+			return fallback
+
+		for key, value in fallback.items():
+			extracted.setdefault(key, value)
+
+		return extracted
 	except Exception:
-		return fallback_extract_slots(text)
+		return fallback
 
 
 def first_missing_slot(slots: Dict[str, Optional[str]]) -> Optional[str]:
@@ -143,6 +292,14 @@ def first_missing_slot(slots: Dict[str, Optional[str]]) -> Optional[str]:
 		if not slots.get(key):
 			return key
 	return None
+
+
+def list_missing_slots(slots: Dict[str, Optional[str]]) -> list[str]:
+	return [
+		key
+		for key in ["roomType", "checkIn", "checkOut", "customerEmail", "customerMobile"]
+		if not slots.get(key)
+	]
 
 
 def missing_prompt(slot_name: str) -> str:
@@ -154,6 +311,56 @@ def missing_prompt(slot_name: str) -> str:
 		"customerMobile": "What mobile number should we use?",
 	}
 	return prompts.get(slot_name, "Please provide the missing booking detail.")
+
+
+def slot_label(slot_name: str) -> str:
+	labels = {
+		"roomType": "room type",
+		"checkIn": "check-in date",
+		"checkOut": "check-out date",
+		"customerEmail": "email",
+		"customerMobile": "mobile number",
+	}
+	return labels.get(slot_name, slot_name)
+
+
+def natural_slot_phrase(slot_name: str) -> str:
+	phrases = {
+		"roomType": "preferred room type",
+		"checkIn": "check-in date",
+		"checkOut": "check-out date",
+		"customerEmail": "email address",
+		"customerMobile": "mobile number",
+	}
+	return phrases.get(slot_name, slot_name)
+
+
+def join_with_and(items: list[str]) -> str:
+	if not items:
+		return ""
+	if len(items) == 1:
+		return items[0]
+	if len(items) == 2:
+		return f"{items[0]} and {items[1]}"
+	return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def build_missing_details_message(missing: list[str]) -> str:
+	phrases = [natural_slot_phrase(item) for item in missing]
+	requested = join_with_and(phrases)
+
+	if set(missing) == {"customerEmail", "customerMobile"}:
+		return (
+			"Great choice. To complete your reservation, may I have your email address and mobile number?\n"
+			"Example: email test@example.com, mobile 81234567"
+		)
+
+	if len(missing) == 1:
+		return f"Great, I can proceed. Could you share your {requested}?"
+
+	return (
+		f"Great, I can proceed. Could you share your {requested} so I can complete the booking?"
+	)
 
 
 def call_orchestrator_book(payload: Dict[str, Any]) -> requests.Response:
@@ -300,10 +507,14 @@ async def book(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 		options_message = None
 
 	if options_message:
-		await update.message.reply_text(options_message)
+		await update.message.reply_text(
+			"Sure, I can help with that.\n\n"
+			f"{options_message}"
+		)
 	else:
 		await update.message.reply_text(
-			"Tell me your booking details in one message or step by step: roomType, checkIn, checkOut, customerEmail, customerMobile."
+			"Sure, I can help with that. Tell me your booking details naturally, for example: "
+			"'I want a deluxe room from 12 April 2026 to 14 April 2026 for 2 guests, email: me@x.com, mobile 81234567'."
 		)
 
 
@@ -314,6 +525,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 	user_id = update.effective_user.id
 	text = update.message.text.strip()
 	state = get_session(user_id)
+	party_size = extract_party_size(text)
+	if party_size:
+		state.party_size = party_size
 
 	if state.awaiting_payment_confirm:
 		lowered = text.lower()
@@ -374,29 +588,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 			return
 
 		if confirm_resp.status_code >= 400:
+			error_message = str(confirm_data.get("error") or confirm_data.get("message") or "Unknown error")
 			await update.message.reply_text(
-				f"Booking finalize failed (HTTP {confirm_resp.status_code}):\n{json.dumps(confirm_data, indent=2)}"
+				f"I couldn't finalize the booking yet ({confirm_resp.status_code}): {error_message}."
 			)
 			return
 
-		await update.message.reply_text(
-			f"Booking finalized successfully.\n\nTx Hash: {tx_hash}\n\nResponse:\n{json.dumps(confirm_data, indent=2)}"
-		)
+		await update.message.reply_text(format_confirm_success_message(confirm_data, tx_hash))
 		clear_booking_flow(state)
 		return
 
 	if not state.collecting:
-		await update.message.reply_text("Use /book to start a booking flow.")
-		return
+		if detect_booking_intent(text):
+			state.collecting = True
+			await update.message.reply_text(
+				"Great, I can help with that booking. I'll extract details from your message now."
+			)
+		else:
+			await update.message.reply_text(
+				"I can help you book rooms. Send something like: "
+				"'Book a standard room from 12 April 2026 to 14 April 2026 for 2 guests, email test@example.com, mobile 81234567' "
+				"or use /book."
+			)
+			return
 
 	extracted = extract_slots_with_openai(text, state.slots)
 	for key, value in extracted.items():
 		if key in state.slots and value:
-			state.slots[key] = str(value)
+			if key == "roomType":
+				state.slots[key] = normalize_room_type(str(value))
+			else:
+				state.slots[key] = str(value)
 
-	missing = first_missing_slot(state.slots)
+	missing = list_missing_slots(state.slots)
 	if missing:
-		await update.message.reply_text(missing_prompt(missing))
+		await update.message.reply_text(build_missing_details_message(missing))
 		return
 
 	book_payload = {
@@ -415,9 +641,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 		return
 
 	if book_resp.status_code >= 400:
-		await update.message.reply_text(
-			f"Booking intent failed (HTTP {book_resp.status_code}):\n{json.dumps(book_data, indent=2)}"
-		)
+		await update.message.reply_text(format_book_intent_failure_message(book_resp.status_code, book_data))
 		return
 
 	payment_intent_id = book_data.get("paymentIntentId")
@@ -441,13 +665,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 	state.awaiting_payment_confirm = True
 
 	await update.message.reply_text(
-		"Step 1 complete.\n"
-		f"paymentIntentId: {payment_intent_id}\n"
-		f"holdId: {hold_id}\n"
-		f"payTo: {pay_to}\n"
-		f"amount: {amount}\n"
-		f"network: {state.payment_info['network']}\n\n"
-		"Reply PAY to confirm and send payment transaction now."
+		format_book_intent_success_message(book_payload, book_data, state.party_size)
 	)
 
 
