@@ -18,11 +18,11 @@ paymentService = os.getenv("PAYMENT_SERVICE", "http://payment-service:5002")
 bookingsService = os.getenv("BOOKINGS_SERVICE", "http://bookings-service:5000")
 roomsService = os.getenv("ROOMS_SERVICE", "http://rooms-service:5003")
 forwardTimeout = float(os.getenv("FORWARD_TIMEOUT", "8"))
-bookingNightlyRate = float(os.getenv("BOOKING_NIGHTLY_RATE", "100"))
 
 redisHost = os.getenv("REDIS_HOST", "localhost")
 redisPort = int(os.getenv("REDIS_PORT", "6379"))
 redisStream = os.getenv("LOYALTY_STREAM", "booking_stream")
+notificationStream = os.getenv("NOTIFICATION_STREAM", "email_stream")
 
 # In-memory sessions: token -> user
 sessions = {}
@@ -99,7 +99,87 @@ def forward(method, url):
     return jsonify(data), resp.status_code
 
 
-# Health (orchestrator)
+def request_json(method, url, payload=None, params=None):
+    """
+    Perform an upstream request and normalize JSON/text responses.
+    """
+    headers = {}
+    if method.upper() in ("POST", "PUT", "PATCH"):
+        headers["Content-Type"] = "application/json"
+
+    try:
+        resp = requests.request(
+            method=method.upper(),
+            url=url,
+            json=payload,
+            params=params,
+            headers=headers,
+            timeout=forwardTimeout,
+        )
+    except requests.Timeout:
+        return 504, {"error": "Upstream timeout"}
+    except requests.ConnectionError:
+        return 502, {"error": "Upstream unavailable"}
+
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {"message": resp.text}
+
+    return resp.status_code, data
+
+
+def publish_booking_cancelled_event(email, booking_id, amount_spent):
+    """
+    Publish loyalty cancellation event to Redis stream used by loyalty consumer.
+    """
+    try:
+        amount = int(float(amount_spent))
+        points = amount // 10
+        loyalty_event = {
+            "event": "booking_cancelled",
+            "email": str(email),
+            "bookingId": str(booking_id),
+            "amount": amount,
+        }
+        redis_client.xadd(redisStream, {"data": json.dumps(loyalty_event)})
+        return {
+            "event": "booking_cancelled",
+            "email": str(email),
+            "pointsDeducted": points,
+            "publishError": None,
+        }
+    except Exception as exc:
+        return {
+            "event": "booking_cancelled",
+            "email": str(email),
+            "pointsDeducted": None,
+            "publishError": str(exc),
+        }
+
+
+def enqueue_cancellation_email(email, booking_id, room_type, check_in, check_out):
+    """
+    Queue cancellation email payload for notification-wrapper consumer.
+    """
+    try:
+        redis_client.xadd(
+            notificationStream,
+            {
+                "to": str(email),
+                "subject": f"Booking #{booking_id} cancelled",
+                "text": (
+                    f"Your booking #{booking_id} for {room_type} from {check_in} to {check_out} "
+                    "has been cancelled and refund processing has been started."
+                ),
+            },
+        )
+        return {"queued": True, "error": None}
+    except Exception as exc:
+        return {"queued": False, "error": str(exc)}
+
+
+# HEALTH CHECK
 @app.get("/health")
 def health():
     """
@@ -108,7 +188,8 @@ def health():
     return jsonify({"status": "ok", "service": "orchestrator"}), 200
 
 
-# AUTH
+
+# AUTH ENDPOINTS
 @app.post("/route-auth/login")
 def routeAuthLogin():
     """
@@ -171,112 +252,8 @@ def routeAuthLogout():
     return jsonify({"message": "logged out"}), 200
 
 
-# PAYMENT
-@app.get("/route-payment/health")
-def routePaymentHealth():
-    """
-    Check that the payment service is reachable for authenticated callers.
-    """
-    unauthorized = checkAuth()
-    if unauthorized:
-        return unauthorized
-    return forward("GET", f"{paymentService}/health")
 
-
-@app.post("/route-payment/payments/create-intents")
-def routePaymentCreateIntents():
-    """
-    Create payment intents by forwarding the request to the payment service.
-    """
-    return forward("POST", f"{paymentService}/payments/create-intents")
-
-
-@app.post("/route-payment/payments/settle")
-def routePaymentSettle():
-    """
-    Settle a payment intent via the payment service.
-    """
-    return forward("POST", f"{paymentService}/payments/settle")
-
-
-@app.post("/route-payment/payments/settle-card")
-def routePaymentSettleCard():
-    """
-    Card-based settlement endpoint forwarded to the payment service.
-    """
-    return forward("POST", f"{paymentService}/payments/settle-card")
-
-
-
-# I need to lock this route to only allow administrator to call this / only call from other function such as cancel booking
-# Pending mikhail part
-@app.post("/route-payment/payments/refund")
-def routePaymentRefund():
-    """
-    Issue a refund through the payment service for an authenticated user.
-    """
-    unauthorized = checkAuth()
-    if unauthorized:
-        return unauthorized
-    return forward("POST", f"{paymentService}/payments/refund")
-
-
-@app.get("/route-payment/payments/<intentId>")
-def routePaymentGet(intentId):
-    """
-    Fetch a single payment intent by ID from the payment service.
-    """
-    unauthorized = checkAuth()
-    if unauthorized:
-        return unauthorized
-    return forward("GET", f"{paymentService}/payments/{intentId}")
-
-
-# BOOKINGS
-@app.post("/route-bookings/bookings/create")
-def routeBookingsCreate():
-    """
-    Create a new booking record through the bookings service.
-    """
-    unauthorized = checkAuth()
-    if unauthorized:
-        return unauthorized
-    return forward("POST", f"{bookingsService}/bookings/create")
-
-
-@app.get("/route-bookings/bookings/<int:booking_id>")
-def routeBookingsGet(booking_id: int):
-    """
-    Return booking details for the given ID from the bookings service.
-    """
-    unauthorized = checkAuth()
-    if unauthorized:
-        return unauthorized
-    return forward("GET", f"{bookingsService}/bookings/{booking_id}")
-
-
-@app.delete("/route-bookings/bookings/<int:booking_id>")
-def routeBookingsDelete(booking_id: int):
-    """
-    Delete a booking in the bookings service based on its ID.
-    """
-    unauthorized = checkAuth()
-    if unauthorized:
-        return unauthorized
-    return forward("DELETE", f"{bookingsService}/bookings/{booking_id}")
-
-
-@app.post("/route-bookings/bookings/update")
-def routeBookingsUpdate():
-    """
-    Update an existing booking, typically identified by hold or booking id.
-    """
-    unauthorized = checkAuth()
-    if unauthorized:
-        return unauthorized
-    return forward("POST", f"{bookingsService}/bookings/update")
-
-
+# SCENARIO 1: BOOK & CONFIRM FLOW (Step 1 & 2 of booking)
 @app.get("/route-rooms/options")
 def routeRoomsOptions():
     """
@@ -351,17 +328,13 @@ def routeRoomsOptions():
 
     options = sorted(grouped.values(), key=lambda item: item["roomType"])
 
-    # Current booking flow charges a flat nightly rate in rooms hold computation.
-    for item in options:
-        item["startingCost"] = bookingNightlyRate
-
     return jsonify({
         "currency": "SGD",
         "roomOptions": options,
     }), 200
 
 
-# Scenario 1 Initial Step for booking a room: create hold and payment intent
+# Scenario 1: Step 1 - Create room hold and payment intent
 @app.post("/route-rooms/book")
 def routeRoomsBook():
     """
@@ -442,6 +415,179 @@ def routeRoomsBook():
             }
 
     return jsonify(payment_data), payment_resp.status_code
+
+
+@app.post("/route-rooms/book/card")
+def routeRoomsBookCard():
+    """
+    Create and finalize a booking in one call using card payment.
+    This endpoint is intended for card-based flows (e.g. scenarios 2/3 setup).
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+
+    payload = request.get_json(silent=True) or {}
+    room_type = payload.get("roomType")
+    check_in = payload.get("checkIn")
+    check_out = payload.get("checkOut")
+    customer_email = payload.get("customerEmail")
+    customer_mobile = payload.get("customerMobile")
+    card_number = payload.get("card_number")
+
+    if not room_type or not check_in or not check_out or not customer_email or not customer_mobile:
+        return jsonify({
+            "error": "roomType, checkIn, checkOut, customerEmail and customerMobile are required"
+        }), 400
+
+    if not card_number:
+        return jsonify({"error": "card_number is required"}), 400
+
+    hold_payload = {
+        "roomType": room_type,
+        "checkIn": check_in,
+        "checkOut": check_out,
+        "customerEmail": customer_email,
+        "customerMobile": customer_mobile,
+    }
+    hold_status, hold_data = request_json(
+        "POST",
+        f"{roomsService}/rooms/holds",
+        hold_payload,
+    )
+    if hold_status >= 400:
+        return jsonify({
+            "error": "Failed to create room hold",
+            "rooms": {"statusCode": hold_status, "data": hold_data},
+        }), hold_status
+
+    hold_id = hold_data.get("holdId")
+    amount = hold_data.get("amount")
+    if not hold_id or amount is None:
+        return jsonify({"error": "rooms response missing holdId or amount"}), 502
+
+    card_settle_payload = {
+        "holdId": hold_id,
+        "amount": amount,
+        "card_number": card_number,
+    }
+    card_status, card_data = request_json(
+        "POST",
+        f"{paymentService}/payments/settle-card",
+        card_settle_payload,
+    )
+    if card_status >= 400:
+        return jsonify({
+            "error": "Card settlement failed",
+            "hold": hold_data,
+            "payment": {"statusCode": card_status, "data": card_data},
+        }), 502
+
+    if (card_data.get("status") or "").upper() != "PAID":
+        return jsonify({
+            "error": "Card payment not marked as PAID",
+            "payment": card_data,
+        }), 400
+
+    provided_booking_id = payload.get("bookingId")
+    if provided_booking_id is not None:
+        try:
+            booking_id = int(provided_booking_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "bookingId must be an integer"}), 400
+    else:
+        booking_id = int(time.time() * 1000) % 2147483647
+
+    booking_payload = {
+        "id": booking_id,
+        "roomID": hold_data.get("roomID"),
+        "roomType": hold_data.get("roomType") or room_type,
+        "customerEmail": customer_email,
+        "customerMobile": customer_mobile,
+        "checkIn": hold_data.get("checkIn") or check_in,
+        "checkOut": hold_data.get("checkOut") or check_out,
+        "amountSpent": amount,
+        "holdId": hold_id,
+    }
+
+    missing_booking_fields = [
+        key for key in [
+            "roomID",
+            "roomType",
+            "customerEmail",
+            "customerMobile",
+            "checkIn",
+            "checkOut",
+            "amountSpent",
+            "holdId",
+        ] if booking_payload.get(key) in (None, "")
+    ]
+    if missing_booking_fields:
+        return jsonify({
+            "error": "Missing booking data for card booking",
+            "missingFields": missing_booking_fields,
+            "hold": hold_data,
+        }), 400
+
+    room_update_payload = {
+        "holdId": hold_id,
+        "status": "reserved",
+        "bookingId": booking_id,
+        "reservationDate": payload.get("reservationDate"),
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        bookings_future = executor.submit(
+            request_json,
+            "POST",
+            f"{bookingsService}/bookings/create",
+            booking_payload,
+        )
+        rooms_future = executor.submit(
+            request_json,
+            "POST",
+            f"{roomsService}/rooms/update",
+            room_update_payload,
+        )
+
+        bookings_status, bookings_data = bookings_future.result()
+        rooms_status, rooms_data = rooms_future.result()
+
+    if bookings_status >= 400 or rooms_status >= 400:
+        return jsonify({
+            "error": "Card booking finalize failed",
+            "payment": card_data,
+            "bookings": {"statusCode": bookings_status, "data": bookings_data},
+            "rooms": {"statusCode": rooms_status, "data": rooms_data},
+        }), 502
+
+    loyalty_publish_error = None
+    try:
+        amount_for_loyalty = int(float(booking_payload["amountSpent"]))
+        points = amount_for_loyalty // 10
+        loyalty_event = {
+            "event": "booking_paid",
+            "email": booking_payload["customerEmail"],
+            "bookingId": str(booking_id),
+            "amount": amount_for_loyalty,
+        }
+        redis_client.xadd(redisStream, {"data": json.dumps(loyalty_event)})
+    except Exception as exc:
+        points = None
+        loyalty_publish_error = str(exc)
+
+    return jsonify({
+        "message": "Card booking finalized successfully",
+        "payment": card_data,
+        "booking": bookings_data,
+        "room": rooms_data,
+        "loyalty": {
+            "event": "booking_paid",
+            "email": booking_payload["customerEmail"],
+            "points": points,
+            "publishError": loyalty_publish_error,
+        },
+    }), 200
 
 
 # Scenario 1: step 2, after payment is successful, we can create the booking record and finalize the hold
@@ -623,6 +769,662 @@ def routeRoomsConfirmBooking():
 
 
 
+# SCENARIO 2: CANCELLATION FLOW
+@app.post("/route-bookings/bookings/<int:booking_id>/cancel")
+def routeBookingsCancel(booking_id: int):
+    """
+    Cancel a booking by orchestrating refund, room release, booking delete,
+    notification queueing, and loyalty points deduction event.
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+
+    payload = request.get_json(silent=True) or {}
+    reason = str(payload.get("reason") or "BOOKING_CANCELLED")
+    user = getUser() or {}
+    user_identifier = (user.get("username") or "").strip().lower()
+    user_role = str(user.get("role") or "").strip().lower()
+
+    booking_status, booking_data = request_json(
+        "GET",
+        f"{bookingsService}/bookings/{booking_id}",
+    )
+    if booking_status >= 400:
+        return jsonify({
+            "error": "Failed to retrieve booking before cancellation",
+            "bookings": {"statusCode": booking_status, "data": booking_data},
+        }), booking_status
+
+    if not isinstance(booking_data, dict):
+        return jsonify({"error": "Unexpected booking payload from bookings service"}), 502
+
+    hold_id = booking_data.get("hold_id") or booking_data.get("holdId")
+    amount_spent = booking_data.get("amount_spent") or booking_data.get("amountSpent")
+    customer_email = booking_data.get("customer_email") or booking_data.get("customerEmail")
+    room_type = booking_data.get("room_type") or booking_data.get("roomType") or "room"
+    check_in = booking_data.get("check_in") or booking_data.get("checkIn") or "N/A"
+    check_out = booking_data.get("check_out") or booking_data.get("checkOut") or "N/A"
+
+    missing_fields = [
+        key
+        for key, value in {
+            "holdId": hold_id,
+            "amountSpent": amount_spent,
+            "customerEmail": customer_email,
+        }.items()
+        if value in (None, "")
+    ]
+    if missing_fields:
+        return jsonify({
+            "error": "Booking record is missing required cancellation fields",
+            "missingFields": missing_fields,
+            "booking": booking_data,
+        }), 502
+
+    booking_owner = str(customer_email).strip().lower()
+    if user_role != "admin" and booking_owner != user_identifier:
+        return jsonify({
+            "error": "Forbidden: booking does not belong to the authenticated user",
+            "bookingId": booking_id,
+            "bookingOwner": customer_email,
+            "authenticatedUser": user.get("username"),
+        }), 403
+
+    refund_payload = {
+        "holdId": hold_id,
+        "amount": amount_spent,
+        "reason": reason,
+    }
+    room_update_payload = {
+        "holdId": hold_id,
+        "status": "available",
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        refund_future = executor.submit(
+            request_json,
+            "POST",
+            f"{paymentService}/payments/refund",
+            refund_payload,
+        )
+        rooms_future = executor.submit(
+            request_json,
+            "POST",
+            f"{roomsService}/rooms/update",
+            room_update_payload,
+        )
+
+        refund_status, refund_data = refund_future.result()
+        rooms_status, rooms_data = rooms_future.result()
+
+    if refund_status >= 400 or rooms_status >= 400:
+        return jsonify({
+            "error": "Cancellation failed during refund or room update",
+            "booking": booking_data,
+            "refund": {"statusCode": refund_status, "data": refund_data},
+            "rooms": {"statusCode": rooms_status, "data": rooms_data},
+        }), 502
+
+    delete_status, delete_data = request_json(
+        "DELETE",
+        f"{bookingsService}/bookings/{booking_id}",
+    )
+    if delete_status >= 400:
+        return jsonify({
+            "error": "Booking cancellation partially completed; booking delete failed",
+            "booking": booking_data,
+            "refund": {"statusCode": refund_status, "data": refund_data},
+            "rooms": {"statusCode": rooms_status, "data": rooms_data},
+            "bookingsDelete": {"statusCode": delete_status, "data": delete_data},
+        }), 502
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        notification_future = executor.submit(
+            enqueue_cancellation_email,
+            customer_email,
+            booking_id,
+            room_type,
+            check_in,
+            check_out,
+        )
+        loyalty_future = executor.submit(
+            publish_booking_cancelled_event,
+            customer_email,
+            booking_id,
+            amount_spent,
+        )
+
+        notification_result = notification_future.result()
+        loyalty_result = loyalty_future.result()
+
+    return jsonify({
+        "message": "Booking cancelled successfully",
+        "booking": booking_data,
+        "refund": refund_data,
+        "room": rooms_data,
+        "bookingsDelete": delete_data,
+        "notification": notification_result,
+        "loyalty": loyalty_result,
+    }), 200
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# SCENARIO 3: BOOKING MODIFICATION FLOW (Step 1 & 2: Preview → Confirm)
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+@app.post("/route-rooms/modify")
+def routeRoomsModifyPreview():
+    """
+    Step 1: Preview booking modification with new hold and price difference.
+    
+    Input: old_booking_id, new_room_type, new_check_in, new_check_out
+    Output: old_cost, new_cost, difference, new_hold_id, old_hold_id (for confirm step)
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+
+    payload = request.get_json(silent=True) or {}
+    old_booking_id = payload.get("old_booking_id")
+    new_room_type = payload.get("new_room_type")
+    new_check_in = payload.get("new_check_in")
+    new_check_out = payload.get("new_check_out")
+    user = getUser() or {}
+    user_identifier = (user.get("username") or "").strip().lower()
+    user_role = str(user.get("role") or "").strip().lower()
+
+    if not old_booking_id or not new_room_type or not new_check_in or not new_check_out:
+        return jsonify({
+            "error": "old_booking_id, new_room_type, new_check_in, new_check_out are required"
+        }), 400
+
+    booking_status, booking_data = request_json(
+        "GET",
+        f"{bookingsService}/bookings/{old_booking_id}",
+    )
+    if booking_status >= 400:
+        return jsonify({
+            "error": "Failed to retrieve old booking",
+            "bookings": {"statusCode": booking_status, "data": booking_data},
+        }), booking_status
+
+    if not isinstance(booking_data, dict):
+        return jsonify({"error": "Unexpected booking payload"}), 502
+
+    old_hold_id = booking_data.get("hold_id") or booking_data.get("holdId")
+    old_amount_spent = booking_data.get("amount_spent") or booking_data.get("amountSpent")
+    customer_email = booking_data.get("customer_email") or booking_data.get("customerEmail")
+    old_room_type = booking_data.get("room_type") or booking_data.get("roomType")
+
+    if not old_hold_id or old_amount_spent is None or not customer_email:
+        return jsonify({
+            "error": "Old booking missing required fields for modification",
+            "missingFields": [k for k in ["holdId", "amountSpent", "customerEmail"] 
+                            if booking_data.get(k) is None]
+        }), 502
+
+    booking_owner = str(customer_email).strip().lower()
+    if user_role != "admin" and booking_owner != user_identifier:
+        return jsonify({
+            "error": "Forbidden: booking does not belong to the authenticated user",
+            "bookingId": old_booking_id,
+            "bookingOwner": customer_email,
+            "authenticatedUser": user.get("username"),
+        }), 403
+
+    new_hold_payload = {
+        "roomType": new_room_type,
+        "checkIn": new_check_in,
+        "checkOut": new_check_out,
+        "customerEmail": customer_email,
+        "customerMobile": booking_data.get("customer_mobile") or booking_data.get("customerMobile"),
+    }
+
+    new_hold_status, new_hold_data = request_json(
+        "POST",
+        f"{roomsService}/rooms/holds",
+        new_hold_payload,
+    )
+    if new_hold_status >= 400:
+        return jsonify({
+            "error": "Failed to create new hold for proposed modification",
+            "rooms": {"statusCode": new_hold_status, "data": new_hold_data},
+        }), new_hold_status
+
+    new_hold_id = new_hold_data.get("holdId")
+    new_amount = new_hold_data.get("amount")
+
+    if not new_hold_id or new_amount is None:
+        return jsonify({
+            "error": "New hold response missing required fields"
+        }), 502
+
+    old_amount = int(float(old_amount_spent))
+    new_amount_int = int(float(new_amount))
+    difference = new_amount_int - old_amount
+    loyalty_delta = difference // 10
+
+    return jsonify({
+        "message": "Modification preview generated successfully",
+        "old_booking": {
+            "bookingId": old_booking_id,
+            "roomType": old_room_type,
+            "cost": old_amount,
+            "holdId": old_hold_id,
+        },
+        "new_booking": {
+            "roomType": new_room_type,
+            "cost": new_amount_int,
+            "holdId": new_hold_id,
+            "checkIn": new_check_in,
+            "checkOut": new_check_out,
+        },
+        "price_adjustment": {
+            "old_cost": old_amount,
+            "new_cost": new_amount_int,
+            "difference": difference,
+            "action": "charge" if difference > 0 else ("refund" if difference < 0 else "none"),
+            "loyalty_delta_points": loyalty_delta,
+        },
+    }), 200
+
+
+@app.post("/route-rooms/book/modify-confirm")
+def routeRoomsConfirmModification():
+    """
+    Step 2: Confirm booking modification with payment settlement and room updates.
+    
+        Input: old_booking_id, new_room_type, new_check_in, new_check_out,
+            new_amount_spent, new_booking_id (optional), new_hold_id,
+            old_hold_id (optional, validated if provided),
+            card_number (required only if difference > 0)
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+
+    payload = request.get_json(silent=True) or {}
+    old_booking_id = payload.get("old_booking_id")
+    new_booking_id = payload.get("new_booking_id")
+    old_hold_id_input = payload.get("old_hold_id")
+    new_hold_id = payload.get("new_hold_id")
+    card_number = payload.get("card_number")
+    user = getUser() or {}
+    user_identifier = (user.get("username") or "").strip().lower()
+    user_role = str(user.get("role") or "").strip().lower()
+
+    if not old_booking_id or not new_hold_id:
+        return jsonify({
+            "error": "old_booking_id and new_hold_id are required"
+        }), 400
+
+    booking_status, booking_data = request_json(
+        "GET",
+        f"{bookingsService}/bookings/{old_booking_id}",
+    )
+    if booking_status >= 400:
+        return jsonify({
+            "error": "Failed to retrieve old booking",
+            "bookings": {"statusCode": booking_status, "data": booking_data},
+        }), booking_status
+
+    if not isinstance(booking_data, dict):
+        return jsonify({"error": "Unexpected booking payload"}), 502
+
+    customer_email = booking_data.get("customer_email") or booking_data.get("customerEmail")
+    old_amount_spent = booking_data.get("amount_spent") or booking_data.get("amountSpent")
+    old_hold_id = booking_data.get("hold_id") or booking_data.get("holdId")
+
+    if not customer_email or old_amount_spent is None or not old_hold_id:
+        return jsonify({
+            "error": "Old booking missing required fields for modification",
+            "booking": booking_data,
+        }), 502
+
+    if old_hold_id_input and str(old_hold_id_input) != str(old_hold_id):
+        return jsonify({
+            "error": "old_hold_id does not match booking record",
+            "providedOldHoldId": old_hold_id_input,
+            "expectedOldHoldId": old_hold_id,
+        }), 400
+
+    booking_owner = str(customer_email).strip().lower()
+    if user_role != "admin" and booking_owner != user_identifier:
+        return jsonify({
+            "error": "Forbidden: booking does not belong to the authenticated user",
+            "bookingId": old_booking_id,
+        }), 403
+
+    new_amount_spent = payload.get("new_amount_spent")
+    if new_amount_spent is None:
+        return jsonify({
+            "error": "new_amount_spent is required. Use /route-rooms/modify response value."
+        }), 400
+
+    try:
+        new_amount_spent = int(float(new_amount_spent))
+    except (TypeError, ValueError):
+        return jsonify({"error": "new_amount_spent must be numeric"}), 400
+
+    if new_amount_spent <= 0:
+        return jsonify({"error": "new_amount_spent must be positive"}), 400
+
+    old_amount = int(float(old_amount_spent))
+    difference = new_amount_spent - old_amount
+    loyalty_delta = difference // 10
+
+    settle_payment_status = None
+    settle_payment_data = None
+    refund_status = None
+    refund_data = None
+
+    if difference > 0:
+        if not card_number:
+            return jsonify({
+                "error": "card_number required for additional payment",
+                "difference": difference,
+            }), 400
+
+        settle_payload = {
+            "holdId": new_hold_id,
+            "amount": difference,
+            "card_number": card_number,
+        }
+        settle_payment_status, settle_payment_data = request_json(
+            "POST",
+            f"{paymentService}/payments/settle-card",
+            settle_payload,
+        )
+        if settle_payment_status >= 400:
+            return jsonify({
+                "error": "Payment settlement failed",
+                "payment": {"statusCode": settle_payment_status, "data": settle_payment_data},
+            }), 502
+
+        if (settle_payment_data.get("status") or "").upper() != "PAID":
+            return jsonify({
+                "error": "Payment not marked as PAID",
+                "payment": settle_payment_data,
+            }), 400
+
+    elif difference < 0:
+        refund_payload = {
+            "holdId": old_hold_id,
+            "amount": abs(difference),
+            "reason": "BOOKING_MODIFIED",
+        }
+        refund_status, refund_data = request_json(
+            "POST",
+            f"{paymentService}/payments/refund",
+            refund_payload,
+        )
+        if refund_status >= 400:
+            return jsonify({
+                "error": "Refund issuance failed",
+                "refund": {"statusCode": refund_status, "data": refund_data},
+            }), 502
+
+    if not new_booking_id:
+        new_booking_id = int(time.time() * 1000) % 2147483647
+
+    new_booking_payload = {
+        "id": new_booking_id,
+        "roomID": payload.get("roomID") or booking_data.get("room_id") or booking_data.get("roomID"),
+        "roomType": payload.get("new_room_type") or booking_data.get("room_type") or booking_data.get("roomType"),
+        "customerEmail": customer_email,
+        "customerMobile": booking_data.get("customer_mobile") or booking_data.get("customerMobile"),
+        "checkIn": payload.get("new_check_in"),
+        "checkOut": payload.get("new_check_out"),
+        "amountSpent": new_amount_spent,
+        "holdId": new_hold_id,
+    }
+
+    missing_booking_fields = [
+        key for key in [
+            "roomID",
+            "roomType",
+            "customerEmail",
+            "customerMobile",
+            "checkIn",
+            "checkOut",
+            "amountSpent",
+            "holdId",
+        ] if new_booking_payload.get(key) in (None, "")
+    ]
+    if missing_booking_fields:
+        return jsonify({
+            "error": "Missing required booking fields for modification confirm",
+            "missingFields": missing_booking_fields,
+        }), 400
+
+    room_release_payload = {
+        "holdId": old_hold_id,
+        "status": "available",
+    }
+
+    room_confirm_payload = {
+        "holdId": new_hold_id,
+        "status": "reserved",
+        "bookingId": new_booking_id,
+    }
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        new_booking_future = executor.submit(
+            request_json,
+            "POST",
+            f"{bookingsService}/bookings/create",
+            new_booking_payload,
+        )
+        room_release_future = executor.submit(
+            request_json,
+            "POST",
+            f"{roomsService}/rooms/update",
+            room_release_payload,
+        )
+        room_confirm_future = executor.submit(
+            request_json,
+            "POST",
+            f"{roomsService}/rooms/update",
+            room_confirm_payload,
+        )
+
+        new_booking_status, new_booking_data = new_booking_future.result()
+        room_release_status, room_release_data = room_release_future.result()
+        room_confirm_status, room_confirm_data = room_confirm_future.result()
+
+    if new_booking_status >= 400 or room_release_status >= 400 or room_confirm_status >= 400:
+        return jsonify({
+            "error": "Modification failed during booking/room updates",
+            "new_booking": {"statusCode": new_booking_status, "data": new_booking_data},
+            "room_release": {"statusCode": room_release_status, "data": room_release_data},
+            "room_confirm": {"statusCode": room_confirm_status, "data": room_confirm_data},
+        }), 502
+
+    delete_old_booking_status, delete_old_booking_data = request_json(
+        "DELETE",
+        f"{bookingsService}/bookings/{old_booking_id}",
+    )
+    if delete_old_booking_status >= 400:
+        return jsonify({
+            "error": "Old booking deletion failed after modification",
+            "new_booking": {"statusCode": new_booking_status, "data": new_booking_data},
+            "delete_old": {"statusCode": delete_old_booking_status, "data": delete_old_booking_data},
+        }), 502
+
+    loyalty_event = {
+        "event": "booking_modified",
+        "email": customer_email,
+        "bookingId": str(new_booking_id),
+        "old_amount": old_amount,
+        "new_amount": new_amount_spent,
+    }
+    
+    loyalty_publish_error = None
+    try:
+        redis_client.xadd(
+            redisStream,
+            {"data": json.dumps(loyalty_event)},
+        )
+    except Exception as exc:
+        loyalty_publish_error = str(exc)
+
+    return jsonify({
+        "message": "Booking modified successfully",
+        "old_booking": {
+            "bookingId": old_booking_id,
+            "cost": old_amount,
+        },
+        "new_booking": new_booking_data,
+        "payment_settlement": {
+            "difference": difference,
+            "action": "charge" if difference > 0 else ("refund" if difference < 0 else "none"),
+            "payment": settle_payment_data if difference > 0 else None,
+            "refund": refund_data if difference < 0 else None,
+        },
+        "rooms": {
+            "old_released": room_release_data,
+            "new_confirmed": room_confirm_data,
+        },
+        "loyalty": {
+            "event": "booking_modified",
+            "email": customer_email,
+            "old_amount": old_amount,
+            "new_amount": new_amount_spent,
+            "points_delta": loyalty_delta,
+            "publishError": loyalty_publish_error,
+        },
+    }), 200
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# SUPPORT & UTILITY ENDPOINTS (Used by scenarios, safe to keep)
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+# Helper endpoints to route to bookings service for booking retrieval, creation, update and deletion.
+@app.get("/route-bookings/bookings/<int:booking_id>")
+def routeBookingsGet(booking_id: int):
+    """
+    Return booking details for the given ID from the bookings service.
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+    return forward("GET", f"{bookingsService}/bookings/{booking_id}")
+
+
+@app.get("/route-bookings/my-bookings")
+def routeBookingsMine():
+    """
+    Return bookings that belong to the currently authenticated user.
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+
+    user = getUser() or {}
+    user_identifier = (user.get("username") or "").strip()
+    if not user_identifier:
+        return jsonify({"error": "Authenticated user missing username"}), 400
+
+    status_code, data = request_json(
+        "GET",
+        f"{bookingsService}/bookings",
+        params={"customerEmail": user_identifier},
+    )
+    return jsonify(data), status_code
+
+
+# These endpoints bypass orchestration and are intended for testing only.
+@app.get("/route-payment/health")
+def routePaymentHealth():
+    """
+    Check that the payment service is reachable for authenticated callers.
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+    return forward("GET", f"{paymentService}/health")
+
+
+@app.post("/route-payment/payments/create-intents")
+def routePaymentCreateIntents():
+    """
+    Create payment intents by forwarding the request to the payment service.
+    """
+    return forward("POST", f"{paymentService}/payments/create-intents")
+
+
+@app.post("/route-payment/payments/settle")
+def routePaymentSettle():
+    """
+    Settle a payment intent via the payment service.
+    """
+    return forward("POST", f"{paymentService}/payments/settle")
+
+
+@app.post("/route-payment/payments/settle-card")
+def routePaymentSettleCard():
+    """
+    Card-based settlement endpoint forwarded to the payment service.
+    """
+    return forward("POST", f"{paymentService}/payments/settle-card")
+
+
+@app.post("/route-payment/payments/refund")
+def routePaymentRefund():
+    """
+    Issue a refund through the payment service for an authenticated user.
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+    return forward("POST", f"{paymentService}/payments/refund")
+
+
+@app.get("/route-payment/payments/<intentId>")
+def routePaymentGet(intentId):
+    """
+    Fetch a single payment intent by ID from the payment service.
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+    return forward("GET", f"{paymentService}/payments/{intentId}")
+
+
+@app.post("/route-bookings/bookings/create")
+def routeBookingsCreate():
+    """
+    Create a new booking record through the bookings service.
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+    return forward("POST", f"{bookingsService}/bookings/create")
+
+
+@app.delete("/route-bookings/bookings/<int:booking_id>")
+def routeBookingsDelete(booking_id: int):
+    """
+    Delete a booking in the bookings service based on its ID.
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+    return forward("DELETE", f"{bookingsService}/bookings/{booking_id}")
+
+
+@app.post("/route-bookings/bookings/update")
+def routeBookingsUpdate():
+    """
+    Update an existing booking, typically identified by hold or booking id.
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+    return forward("POST", f"{bookingsService}/bookings/update")
+
 
 @app.post("/route-rooms/rooms/holds")
 @app.post("/rooms/holds")
@@ -706,7 +1508,6 @@ def routeRoomsUpdateReservation():
     return forward("POST", f"{roomsService}/rooms/update-reservation")
 
 
-# LOYALTY
 @app.post("/route-loyalty/add-points")
 def routeLoyaltyAddPoints():
     """

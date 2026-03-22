@@ -80,6 +80,34 @@ def get_booking(booking_id):
         return jsonify({"message": "Failed to fetch booking", "error": str(e)}), 500
 
 
+@app.get("/bookings")
+def list_bookings():
+    """
+    List bookings, optionally filtered by customerEmail query parameter.
+    """
+    customer_email = (request.args.get("customerEmail") or "").strip()
+
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        if customer_email:
+            cursor.execute(
+                "SELECT * FROM bookings WHERE customer_email = %s ORDER BY id DESC",
+                (customer_email,),
+            )
+        else:
+            cursor.execute("SELECT * FROM bookings ORDER BY id DESC")
+
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        return jsonify(rows), 200
+    except Error as e:
+        return jsonify({"message": "Failed to fetch bookings", "error": str(e)}), 500
+
+
 #allows the creation of a booking
 @app.post("/bookings/create")
 def create_booking():

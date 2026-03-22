@@ -144,7 +144,17 @@ def create_hold():
         if nights <= 0:
             return jsonify({"error": "checkOut must be after checkIn"}), 400
 
-        cost = nights * 100
+        # Price hold based on the room's quoted nightly rate from DB.
+        nightly_rate_raw = room.get("costForTonight")
+        try:
+            nightly_rate = float(nightly_rate_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid room nightly rate in database"}), 500
+
+        if nightly_rate <= 0:
+            return jsonify({"error": "Room nightly rate must be positive"}), 500
+
+        cost = round(nights * nightly_rate, 2)
 
         # 4. update room
         cursor.execute("""
