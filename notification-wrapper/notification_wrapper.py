@@ -1,4 +1,5 @@
 import os
+import time
 import redis
 import requests
 
@@ -11,12 +12,19 @@ CONSUMER_NAME = os.getenv("CONSUMER_NAME", "consumer_1")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL")
 
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+def get_redis_client():
+    return redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        decode_responses=True,
+        socket_keepalive=True,
+        health_check_interval=30,
+    )
 
 
-def create_group():
+def create_group(client):
     try:
-        r.xgroup_create(STREAM_NAME, GROUP_NAME, id="0", mkstream=True)
+        client.xgroup_create(STREAM_NAME, GROUP_NAME, id="0", mkstream=True)
         print(f"Consumer group '{GROUP_NAME}' created")
     except redis.exceptions.ResponseError as e:
         if "BUSYGROUP" in str(e):
@@ -57,16 +65,28 @@ def send_to_resend(fields):
 
 
 def consume():
-    create_group()
+    client = get_redis_client()
+    create_group(client)
 
     while True:
-        messages = r.xreadgroup(
-            groupname=GROUP_NAME,
-            consumername=CONSUMER_NAME,
-            streams={STREAM_NAME: ">"},
-            count=1,
-            block=5000
-        )
+        try:
+            messages = client.xreadgroup(
+                groupname=GROUP_NAME,
+                consumername=CONSUMER_NAME,
+                streams={STREAM_NAME: ">"},
+                count=1,
+                block=5000,
+            )
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
+            print("Redis disconnected, reconnecting:", e)
+            time.sleep(2)
+            try:
+                client = get_redis_client()
+                create_group(client)
+            except Exception as reconnect_error:
+                print("Redis reconnect failed:", reconnect_error)
+                time.sleep(2)
+            continue
 
         if not messages:
             continue
@@ -76,7 +96,7 @@ def consume():
                 try:
                     print("Received:", message_id, fields)
                     send_to_resend(fields)
-                    r.xack(STREAM_NAME, GROUP_NAME, message_id)
+                    client.xack(STREAM_NAME, GROUP_NAME, message_id)
                     print("Acknowledged:", message_id)
                 except Exception as e:
                     print("Error processing message:", e)

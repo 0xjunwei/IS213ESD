@@ -23,6 +23,17 @@ redisHost = os.getenv("REDIS_HOST", "localhost")
 redisPort = int(os.getenv("REDIS_PORT", "6379"))
 redisStream = os.getenv("LOYALTY_STREAM", "booking_stream")
 notificationStream = os.getenv("NOTIFICATION_STREAM", "email_stream")
+redisFallbackEnabled = os.getenv("REDIS_FALLBACK_ENABLED", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+redisHostCandidates = [
+    host.strip()
+    for host in os.getenv("REDIS_HOST_CANDIDATES", "").split(",")
+    if host.strip()
+]
 
 # In-memory sessions: token -> user
 sessions = {}
@@ -30,9 +41,48 @@ sessions = {}
 # Cache booking context between step-1 and step-2 by payment intent id.
 pendingBookings = {}
 
+# Cache hold context for card-based settle flow keyed by holdId.
+pendingCardBookings = {}
 
-# Redis client (used for loyalty events)
-redis_client = redis.Redis(host=redisHost, port=redisPort, decode_responses=True)
+
+# Redis client (used for loyalty + notification events)
+redis_client = None
+
+
+def get_redis_client():
+    """
+    Resolve and cache a reachable Redis client across common Docker host setups.
+    """
+    global redis_client
+    if redis_client is not None:
+        return redis_client
+
+    host_candidates = []
+    if redisHost:
+        host_candidates.append(redisHost)
+
+    if redisFallbackEnabled:
+        host_candidates.extend(redisHostCandidates)
+        host_candidates.extend(["host.docker.internal", "localhost", "redis"])
+
+    seen = set()
+    unique_hosts = []
+    for host in host_candidates:
+        if host not in seen:
+            seen.add(host)
+            unique_hosts.append(host)
+
+    last_error = None
+    for host in unique_hosts:
+        try:
+            candidate = redis.Redis(host=host, port=redisPort, decode_responses=True)
+            candidate.ping()
+            redis_client = candidate
+            return redis_client
+        except Exception as exc:
+            last_error = exc
+
+    raise ConnectionError(f"Unable to connect to Redis on port {redisPort}: {last_error}")
 
 
 # helper functions
@@ -129,6 +179,33 @@ def request_json(method, url, payload=None, params=None):
     return resp.status_code, data
 
 
+def get_hold_context_from_rooms(hold_id):
+    """
+    Resolve hold context from rooms service so settle-card can still finalize after restarts.
+    """
+    if not hold_id:
+        return {}
+
+    status_code, rooms_data = request_json("GET", f"{roomsService}/rooms")
+    if status_code >= 400 or not isinstance(rooms_data, list):
+        return {}
+
+    hold_id_str = str(hold_id)
+    for room in rooms_data:
+        if str(room.get("holdId") or "") != hold_id_str:
+            continue
+
+        return {
+            "holdId": hold_id_str,
+            "roomID": room.get("roomID"),
+            "roomType": room.get("roomType"),
+            "checkIn": room.get("checkIn"),
+            "checkOut": room.get("checkOut"),
+        }
+
+    return {}
+
+
 def publish_booking_cancelled_event(email, booking_id, amount_spent):
     """
     Publish loyalty cancellation event to Redis stream used by loyalty consumer.
@@ -142,7 +219,7 @@ def publish_booking_cancelled_event(email, booking_id, amount_spent):
             "bookingId": str(booking_id),
             "amount": amount,
         }
-        redis_client.xadd(redisStream, {"data": json.dumps(loyalty_event)})
+        get_redis_client().xadd(redisStream, {"data": json.dumps(loyalty_event)})
         return {
             "event": "booking_cancelled",
             "email": str(email),
@@ -163,7 +240,7 @@ def enqueue_cancellation_email(email, booking_id, room_type, check_in, check_out
     Queue cancellation email payload for notification-wrapper consumer.
     """
     try:
-        redis_client.xadd(
+        get_redis_client().xadd(
             notificationStream,
             {
                 "to": str(email),
@@ -378,6 +455,17 @@ def routeRoomsBook():
     if not hold_id or amount is None:
         return jsonify({"error": "rooms response missing holdId or amount"}), 502
 
+    pendingCardBookings[str(hold_id)] = {
+        "holdId": hold_id,
+        "roomID": hold_data.get("roomID"),
+        "roomType": hold_data.get("roomType") or roomType,
+        "checkIn": hold_data.get("checkIn") or checkIn,
+        "checkOut": hold_data.get("checkOut") or checkOut,
+        "amount": amount,
+        "customerEmail": customerEmail,
+        "customerMobile": customerMobile,
+    }
+
     payment_payload = {
         "holdId": hold_id,
         "amount": amount,
@@ -571,7 +659,7 @@ def routeRoomsBookCard():
             "bookingId": str(booking_id),
             "amount": amount_for_loyalty,
         }
-        redis_client.xadd(redisStream, {"data": json.dumps(loyalty_event)})
+        get_redis_client().xadd(redisStream, {"data": json.dumps(loyalty_event)})
     except Exception as exc:
         points = None
         loyalty_publish_error = str(exc)
@@ -744,7 +832,7 @@ def routeRoomsConfirmBooking():
             "bookingId": str(booking_id),
             "amount": amount_for_loyalty,
         }
-        redis_client.xadd(
+        get_redis_client().xadd(
             redisStream,
             {"data": json.dumps(loyalty_event)},
         )
@@ -1262,7 +1350,7 @@ def routeRoomsConfirmModification():
     
     loyalty_publish_error = None
     try:
-        redis_client.xadd(
+        get_redis_client().xadd(
             redisStream,
             {"data": json.dumps(loyalty_event)},
         )
@@ -1323,9 +1411,9 @@ def routeBookingsMine():
         return unauthorized
 
     user = getUser() or {}
-    user_identifier = (user.get("username") or "").strip()
+    user_identifier = (user.get("email") or user.get("username") or "").strip()
     if not user_identifier:
-        return jsonify({"error": "Authenticated user missing username"}), 400
+        return jsonify({"error": "Authenticated user missing email/username"}), 400
 
     status_code, data = request_json(
         "GET",
@@ -1366,9 +1454,171 @@ def routePaymentSettle():
 @app.post("/route-payment/payments/settle-card")
 def routePaymentSettleCard():
     """
-    Card-based settlement endpoint forwarded to the payment service.
+    Settle a card payment and auto-finalize booking when hold context is available.
     """
-    return forward("POST", f"{paymentService}/payments/settle-card")
+    payload = request.get_json(silent=True) or {}
+    hold_id = payload.get("holdId")
+    amount = payload.get("amount")
+    card_number = payload.get("card_number")
+    customer_email = str(payload.get("customerEmail") or "").strip()
+    customer_mobile = str(payload.get("customerMobile") or "").strip()
+
+    if not hold_id:
+        return jsonify({"error": "holdId is required"}), 400
+    if amount is None:
+        return jsonify({"error": "amount is required"}), 400
+    if not card_number:
+        return jsonify({"error": "card_number is required"}), 400
+    if not customer_email:
+        return jsonify({"error": "customerEmail is required"}), 400
+    if not customer_mobile:
+        return jsonify({"error": "customerMobile is required"}), 400
+
+    context = pendingCardBookings.get(str(hold_id), {}).copy()
+    if not context:
+        context = get_hold_context_from_rooms(hold_id)
+
+    settle_amount = amount
+    context_amount = context.get("amount")
+    if context_amount is not None:
+        try:
+            requested_amount = int(float(amount))
+            expected_amount = int(float(context_amount))
+        except (TypeError, ValueError):
+            return jsonify({"error": "amount must be numeric"}), 400
+
+        if requested_amount != expected_amount:
+            return jsonify({
+                "error": "amount does not match hold amount",
+                "requestedAmount": requested_amount,
+                "expectedAmount": expected_amount,
+                "holdId": hold_id,
+            }), 400
+
+        settle_amount = expected_amount
+
+    settle_status, settle_data = request_json(
+        "POST",
+        f"{paymentService}/payments/settle-card",
+        {
+            "holdId": hold_id,
+            "amount": settle_amount,
+            "card_number": card_number,
+        },
+    )
+    if settle_status >= 400:
+        return jsonify(settle_data), settle_status
+
+    if (settle_data.get("status") or "").upper() != "PAID":
+        return jsonify({
+            "error": "Card payment not marked as PAID",
+            "payment": settle_data,
+        }), 400
+
+    provided_booking_id = payload.get("bookingId")
+    if provided_booking_id is not None:
+        try:
+            booking_id = int(provided_booking_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "bookingId must be an integer"}), 400
+    else:
+        booking_id = int(time.time() * 1000) % 2147483647
+
+    booking_payload = {
+        "id": booking_id,
+        "roomID": payload.get("roomID") or context.get("roomID"),
+        "roomType": payload.get("roomType") or context.get("roomType"),
+        "customerEmail": customer_email,
+        "customerMobile": customer_mobile,
+        "checkIn": payload.get("checkIn") or context.get("checkIn"),
+        "checkOut": payload.get("checkOut") or context.get("checkOut"),
+        "amountSpent": payload.get("amountSpent") or context.get("amount") or amount,
+        "holdId": hold_id,
+    }
+
+    missing_booking_fields = [
+        key for key in [
+            "roomID",
+            "roomType",
+            "customerEmail",
+            "customerMobile",
+            "checkIn",
+            "checkOut",
+            "amountSpent",
+            "holdId",
+        ] if booking_payload.get(key) in (None, "")
+    ]
+    if missing_booking_fields:
+        return jsonify({
+            "message": "Payment settled, but booking was not auto-created due to missing fields",
+            "payment": settle_data,
+            "autoBookingCreated": False,
+            "missingFields": missing_booking_fields,
+            "hint": "Pass complete booking fields in settle-card request (customerEmail/customerMobile are now mandatory)",
+        }), 202
+
+    room_update_payload = {
+        "holdId": hold_id,
+        "status": payload.get("roomStatus", "reserved"),
+        "bookingId": booking_id,
+        "reservationDate": payload.get("reservationDate"),
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        bookings_future = executor.submit(
+            request_json,
+            "POST",
+            f"{bookingsService}/bookings/create",
+            booking_payload,
+        )
+        rooms_future = executor.submit(
+            request_json,
+            "POST",
+            f"{roomsService}/rooms/update",
+            room_update_payload,
+        )
+
+        bookings_status, bookings_data = bookings_future.result()
+        rooms_status, rooms_data = rooms_future.result()
+
+    if bookings_status >= 400 or rooms_status >= 400:
+        return jsonify({
+            "error": "Card settlement succeeded but booking finalization failed",
+            "payment": settle_data,
+            "bookings": {"statusCode": bookings_status, "data": bookings_data},
+            "rooms": {"statusCode": rooms_status, "data": rooms_data},
+        }), 502
+
+    loyalty_publish_error = None
+    try:
+        amount_for_loyalty = int(float(booking_payload["amountSpent"]))
+        points = amount_for_loyalty // 10
+        loyalty_event = {
+            "event": "booking_paid",
+            "email": booking_payload["customerEmail"],
+            "bookingId": str(booking_id),
+            "amount": amount_for_loyalty,
+        }
+        get_redis_client().xadd(redisStream, {"data": json.dumps(loyalty_event)})
+    except Exception as exc:
+        points = None
+        loyalty_publish_error = str(exc)
+
+    pendingCardBookings.pop(str(hold_id), None)
+
+    return jsonify({
+        "message": "Card settled and booking finalized successfully",
+        "payment": settle_data,
+        "booking": bookings_data,
+        "room": rooms_data,
+        "loyalty": {
+            "event": "booking_paid",
+            "email": booking_payload["customerEmail"],
+            "points": points,
+            "publishError": loyalty_publish_error,
+        },
+        "autoBookingCreated": True,
+    }), 200
 
 
 @app.post("/route-payment/payments/refund")
@@ -1440,7 +1690,24 @@ def routeRoomsCreateHold():
     if not roomType or not checkIn or not checkOut:
         return jsonify({"error": "roomType, checkIn and checkOut are required"}), 400
 
-    return forward("POST", f"{roomsService}/rooms/holds")
+    hold_status, hold_data = request_json("POST", f"{roomsService}/rooms/holds", payload)
+
+    if hold_status < 400 and isinstance(hold_data, dict):
+        hold_id = hold_data.get("holdId")
+        amount = hold_data.get("amount")
+        if hold_id and amount is not None:
+            pendingCardBookings[str(hold_id)] = {
+                "holdId": hold_id,
+                "roomID": hold_data.get("roomID"),
+                "roomType": hold_data.get("roomType") or roomType,
+                "checkIn": hold_data.get("checkIn") or checkIn,
+                "checkOut": hold_data.get("checkOut") or checkOut,
+                "amount": amount,
+                "customerEmail": payload.get("customerEmail"),
+                "customerMobile": payload.get("customerMobile"),
+            }
+
+    return jsonify(hold_data), hold_status
 
 
 @app.post("/route-rooms/rooms/update")
@@ -1524,7 +1791,7 @@ def routeLoyaltyAddPoints():
     if not email or points is None:
         return jsonify({"error": "email and points are required"}), 400
 
-    redis_client.xadd(
+    get_redis_client().xadd(
         redisStream,
         {
             "event": "add_points",
@@ -1552,7 +1819,7 @@ def routeLoyaltyDeductPoints():
     if not email or points is None:
         return jsonify({"error": "email and points are required"}), 400
 
-    redis_client.xadd(
+    get_redis_client().xadd(
         redisStream,
         {
             "event": "deduct_points",

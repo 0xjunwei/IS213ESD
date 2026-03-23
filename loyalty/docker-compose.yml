@@ -2,6 +2,10 @@ services:
   redis:
     image: redis:7
     container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - my-shared-network
 
   consumer:
     build: .
@@ -10,3 +14,9 @@ services:
       - PYTHONPATH=/app
     depends_on:
       - redis
+    networks:
+      - my-shared-network
+
+networks:
+  my-shared-network:
+    external: true

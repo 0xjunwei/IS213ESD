@@ -6,3 +6,9 @@ services:
     container_name: resend-wrapper
     env_file:
       - .env
+    networks:
+      - my-shared-network
+
+networks:
+  my-shared-network:
+    external: true
