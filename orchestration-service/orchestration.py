@@ -8,8 +8,10 @@ from email.utils import parsedate_to_datetime
 import redis
 import requests
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 
 
 # Config (override via env vars as needed)
@@ -38,10 +40,10 @@ redisHostCandidates = [
 # In-memory sessions: token -> user
 sessions = {}
 
-# Cache booking context between step-1 and step-2 by payment intent id.
+# Booking context keyed by payment intent id.
 pendingBookings = {}
 
-# Cache hold context for card-based settle flow keyed by holdId.
+# Hold context for card-settle flow keyed by holdId.
 pendingCardBookings = {}
 
 
@@ -49,7 +51,7 @@ pendingCardBookings = {}
 redis_client = None
 
 
-def get_redis_client():
+def getRedisClient():
     """
     Resolve and cache a reachable Redis client across common Docker host setups.
     """
@@ -85,7 +87,7 @@ def get_redis_client():
     raise ConnectionError(f"Unable to connect to Redis on port {redisPort}: {last_error}")
 
 
-# helper functions
+# Helpers
 def getToken():
     """
     Get the token from the request headers.
@@ -103,7 +105,64 @@ def getUser():
     token = getToken()
     if not token:
         return None
+
     return sessions.get(token)
+
+def computeRefundSplit(holdIds, totalAmount):
+    """Build a refund split across hold IDs using payment-service capacity."""
+    capacities = []
+    warnings = []
+
+    for holdId in holdIds:
+        status, data = requestJson(
+            "GET",
+            f"{paymentService}/payments/refund-capacity/{holdId}",
+        )
+
+        if status == 200 and isinstance(data, dict):
+            try:
+                remaining = int(float(data.get("remainingRefundable", 0)))
+            except (TypeError, ValueError):
+                remaining = 0
+
+            capacities.append({
+                "holdId": holdId,
+                "remaining": max(remaining, 0),
+                "raw": data,
+            })
+            continue
+
+        if status == 404:
+            warnings.append(f"No paid payment found for holdId {holdId}")
+            capacities.append({"holdId": holdId, "remaining": 0, "raw": data})
+            continue
+
+        return None, {
+            "error": "Failed to fetch refund capacity",
+            "holdId": holdId,
+            "payment": {"statusCode": status, "data": data},
+        }, warnings
+
+    remainingTarget = int(totalAmount)
+    split = []
+
+    for item in capacities:
+        if remainingTarget <= 0:
+            break
+
+        refundableHere = min(item["remaining"], remainingTarget)
+        if refundableHere > 0:
+            split.append({
+                "holdId": item["holdId"],
+                "amount": refundableHere,
+            })
+            remainingTarget -= refundableHere
+
+    return {
+        "split": split,
+        "shortfall": remainingTarget,
+        "capacities": capacities,
+    }, None, warnings
 
 
 def checkAuth():
@@ -114,6 +173,53 @@ def checkAuth():
     user = getUser()
     if not user:
         return jsonify({"error": "Unauthorized"}), 401
+    return None
+
+
+def normalizeDateString(value):
+    """
+    Normalize date string to YYYY-MM-DD format.
+    Handles RFC format (e.g., 'Wed, 25 Mar 2026 00:00:00 GMT'),
+    ISO format (e.g., '2026-03-25T00:00:00Z'), and YYYY-MM-DD format.
+    Returns None if unable to parse.
+    """
+    if not value:
+        return None
+    
+    text = str(value).strip()
+    if not text:
+        return None
+    
+    # Already in YYYY-MM-DD format
+    if len(text) == 10 and text[4] == '-' and text[7] == '-':
+        try:
+            datetime.strptime(text, "%Y-%m-%d")
+            return text
+        except ValueError:
+            pass
+    
+    # Try parsing with various formats
+    formats = [
+        "%Y-%m-%d %H:%M:%S",           # 2026-03-25 00:00:00
+        "%Y-%m-%dT%H:%M:%SZ",          # 2026-03-25T00:00:00Z
+        "%Y-%m-%dT%H:%M:%S.%fZ",       # 2026-03-25T00:00:00.000Z
+        "%a, %d %b %Y %H:%M:%S %Z",    # Wed, 25 Mar 2026 00:00:00 GMT (RFC 2822)
+    ]
+    
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(text.replace('GMT', 'UTC'), fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    
+    # Final fallback: try general parsing
+    try:
+        dt = datetime.fromisoformat(text.replace('Z', '+00:00'))
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        pass
+    
     return None
 
 
@@ -149,7 +255,7 @@ def forward(method, url):
     return jsonify(data), resp.status_code
 
 
-def request_json(method, url, payload=None, params=None):
+def requestJson(method, url, payload=None, params=None):
     """
     Perform an upstream request and normalize JSON/text responses.
     """
@@ -179,24 +285,24 @@ def request_json(method, url, payload=None, params=None):
     return resp.status_code, data
 
 
-def get_hold_context_from_rooms(hold_id):
+def getHoldContextFromRooms(holdId):
     """
     Resolve hold context from rooms service so settle-card can still finalize after restarts.
     """
-    if not hold_id:
+    if not holdId:
         return {}
 
-    status_code, rooms_data = request_json("GET", f"{roomsService}/rooms")
+    status_code, rooms_data = requestJson("GET", f"{roomsService}/rooms")
     if status_code >= 400 or not isinstance(rooms_data, list):
         return {}
 
-    hold_id_str = str(hold_id)
+    holdIdStr = str(holdId)
     for room in rooms_data:
-        if str(room.get("holdId") or "") != hold_id_str:
+        if str(room.get("holdId") or "") != holdIdStr:
             continue
 
         return {
-            "holdId": hold_id_str,
+            "holdId": holdIdStr,
             "roomID": room.get("roomID"),
             "roomType": room.get("roomType"),
             "checkIn": room.get("checkIn"),
@@ -206,7 +312,7 @@ def get_hold_context_from_rooms(hold_id):
     return {}
 
 
-def publish_booking_cancelled_event(email, booking_id, amount_spent):
+def publishBookingCancelledEvent(email, booking_id, amount_spent):
     """
     Publish loyalty cancellation event to Redis stream used by loyalty consumer.
     """
@@ -219,7 +325,7 @@ def publish_booking_cancelled_event(email, booking_id, amount_spent):
             "bookingId": str(booking_id),
             "amount": amount,
         }
-        get_redis_client().xadd(redisStream, {"data": json.dumps(loyalty_event)})
+        getRedisClient().xadd(redisStream, {"data": json.dumps(loyalty_event)})
         return {
             "event": "booking_cancelled",
             "email": str(email),
@@ -235,12 +341,12 @@ def publish_booking_cancelled_event(email, booking_id, amount_spent):
         }
 
 
-def enqueue_cancellation_email(email, booking_id, room_type, check_in, check_out):
+def enqueueCancellationEmail(email, booking_id, room_type, check_in, check_out):
     """
     Queue cancellation email payload for notification-wrapper consumer.
     """
     try:
-        get_redis_client().xadd(
+        getRedisClient().xadd(
             notificationStream,
             {
                 "to": str(email),
@@ -330,11 +436,11 @@ def routeAuthLogout():
 
 
 
-# SCENARIO 1: BOOK & CONFIRM FLOW (Step 1 & 2 of booking)
+# Booking flow
 @app.get("/route-rooms/options")
 def routeRoomsOptions():
     """
-    Return room type options and indicative costs for conversational clients.
+    Return room type options and indicative costs.
     """
     try:
         upstream = requests.get(
@@ -411,7 +517,6 @@ def routeRoomsOptions():
     }), 200
 
 
-# Scenario 1: Step 1 - Create room hold and payment intent
 @app.post("/route-rooms/book")
 def routeRoomsBook():
     """
@@ -429,10 +534,32 @@ def routeRoomsBook():
             "error": "roomType, checkIn, checkOut, customerEmail and customerMobile are required"
         }), 400
 
+    # Normalize date strings before calling rooms service.
+    normalized_check_in = normalizeDateString(checkIn)
+    normalized_check_out = normalizeDateString(checkOut)
+    
+    if not normalized_check_in or not normalized_check_out:
+        return jsonify({
+            "error": "Invalid date format for check-in or check-out",
+            "received": {
+                "checkIn": checkIn,
+                "checkOut": checkOut,
+            },
+            "expected_format": "YYYY-MM-DD or RFC format (e.g., 'Wed, 25 Mar 2026 00:00:00 GMT')"
+        }), 400
+
+    normalized_payload = {
+        "roomType": roomType,
+        "checkIn": normalized_check_in,
+        "checkOut": normalized_check_out,
+        "customerEmail": customerEmail,
+        "customerMobile": customerMobile,
+    }
+
     try:
         hold_resp = requests.post(
             f"{roomsService}/rooms/holds",
-            json=payload,
+            json=normalized_payload,
             headers={"Content-Type": "application/json"},
             timeout=forwardTimeout,
         )
@@ -447,7 +574,11 @@ def routeRoomsBook():
         hold_data = {"message": hold_resp.text}
 
     if hold_resp.status_code >= 400:
-        return jsonify(hold_data), hold_resp.status_code
+        return jsonify({
+            "error": "Failed to create room hold",
+            "rooms": hold_data,
+            "sentPayload": normalized_payload,
+        }), hold_resp.status_code
 
     hold_id = hold_data.get("holdId")
     amount = hold_data.get("amount")
@@ -459,8 +590,8 @@ def routeRoomsBook():
         "holdId": hold_id,
         "roomID": hold_data.get("roomID"),
         "roomType": hold_data.get("roomType") or roomType,
-        "checkIn": hold_data.get("checkIn") or checkIn,
-        "checkOut": hold_data.get("checkOut") or checkOut,
+        "checkIn": hold_data.get("checkIn") or normalized_check_in,
+        "checkOut": hold_data.get("checkOut") or normalized_check_out,
         "amount": amount,
         "customerEmail": customerEmail,
         "customerMobile": customerMobile,
@@ -495,8 +626,8 @@ def routeRoomsBook():
                 "holdId": hold_id,
                 "roomID": hold_data.get("roomID"),
                 "roomType": hold_data.get("roomType"),
-                "checkIn": hold_data.get("checkIn"),
-                "checkOut": hold_data.get("checkOut"),
+                "checkIn": hold_data.get("checkIn") or normalized_check_in,
+                "checkOut": hold_data.get("checkOut") or normalized_check_out,
                 "amount": amount,
                 "customerEmail": customerEmail,
                 "customerMobile": customerMobile,
@@ -509,96 +640,110 @@ def routeRoomsBook():
 def routeRoomsBookCard():
     """
     Create and finalize a booking in one call using card payment.
-    This endpoint is intended for card-based flows (e.g. scenarios 2/3 setup).
     """
     unauthorized = checkAuth()
     if unauthorized:
         return unauthorized
 
     payload = request.get_json(silent=True) or {}
-    room_type = payload.get("roomType")
-    check_in = payload.get("checkIn")
-    check_out = payload.get("checkOut")
-    customer_email = payload.get("customerEmail")
-    customer_mobile = payload.get("customerMobile")
-    card_number = payload.get("card_number")
+    roomType = payload.get("roomType")
+    checkIn = payload.get("checkIn")
+    checkOut = payload.get("checkOut")
+    customerEmail = payload.get("customerEmail")
+    customerMobile = payload.get("customerMobile")
+    cardNumber = payload.get("card_number")
 
-    if not room_type or not check_in or not check_out or not customer_email or not customer_mobile:
+    if not roomType or not checkIn or not checkOut or not customerEmail or not customerMobile:
         return jsonify({
             "error": "roomType, checkIn, checkOut, customerEmail and customerMobile are required"
         }), 400
 
-    if not card_number:
+    if not cardNumber:
         return jsonify({"error": "card_number is required"}), 400
 
-    hold_payload = {
-        "roomType": room_type,
-        "checkIn": check_in,
-        "checkOut": check_out,
-        "customerEmail": customer_email,
-        "customerMobile": customer_mobile,
-    }
-    hold_status, hold_data = request_json(
-        "POST",
-        f"{roomsService}/rooms/holds",
-        hold_payload,
-    )
-    if hold_status >= 400:
+    # Normalize date strings before calling rooms service.
+    normalizedCheckIn = normalizeDateString(checkIn)
+    normalizedCheckOut = normalizeDateString(checkOut)
+    
+    if not normalizedCheckIn or not normalizedCheckOut:
         return jsonify({
-            "error": "Failed to create room hold",
-            "rooms": {"statusCode": hold_status, "data": hold_data},
-        }), hold_status
-
-    hold_id = hold_data.get("holdId")
-    amount = hold_data.get("amount")
-    if not hold_id or amount is None:
-        return jsonify({"error": "rooms response missing holdId or amount"}), 502
-
-    card_settle_payload = {
-        "holdId": hold_id,
-        "amount": amount,
-        "card_number": card_number,
-    }
-    card_status, card_data = request_json(
-        "POST",
-        f"{paymentService}/payments/settle-card",
-        card_settle_payload,
-    )
-    if card_status >= 400:
-        return jsonify({
-            "error": "Card settlement failed",
-            "hold": hold_data,
-            "payment": {"statusCode": card_status, "data": card_data},
-        }), 502
-
-    if (card_data.get("status") or "").upper() != "PAID":
-        return jsonify({
-            "error": "Card payment not marked as PAID",
-            "payment": card_data,
+            "error": "Invalid date format for check-in or check-out",
+            "received": {
+                "checkIn": checkIn,
+                "checkOut": checkOut,
+            },
+            "expected_format": "YYYY-MM-DD or RFC format (e.g., 'Wed, 25 Mar 2026 00:00:00 GMT')"
         }), 400
 
-    provided_booking_id = payload.get("bookingId")
-    if provided_booking_id is not None:
+    holdPayload = {
+        "roomType": roomType,
+        "checkIn": normalizedCheckIn,
+        "checkOut": normalizedCheckOut,
+        "customerEmail": customerEmail,
+        "customerMobile": customerMobile,
+    }
+    holdStatus, holdData = requestJson(
+        "POST",
+        f"{roomsService}/rooms/holds",
+        holdPayload,
+    )
+    if holdStatus >= 400:
+        return jsonify({
+            "error": "Failed to create room hold",
+            "rooms": {"statusCode": holdStatus, "data": holdData},
+            "sentPayload": holdPayload,
+        }), holdStatus
+
+    holdId = holdData.get("holdId")
+    amount = holdData.get("amount")
+    if not holdId or amount is None:
+        return jsonify({"error": "rooms response missing holdId or amount"}), 502
+
+    cardSettlePayload = {
+        "holdId": holdId,
+        "amount": amount,
+        "card_number": cardNumber,
+    }
+    cardStatus, cardData = requestJson(
+        "POST",
+        f"{paymentService}/payments/settle-card",
+        cardSettlePayload,
+    )
+    if cardStatus >= 400:
+        return jsonify({
+            "error": "Card settlement failed",
+            "hold": holdData,
+            "payment": {"statusCode": cardStatus, "data": cardData},
+        }), 502
+
+    if (cardData.get("status") or "").upper() != "PAID":
+        return jsonify({
+            "error": "Card payment not marked as PAID",
+            "payment": cardData,
+        }), 400
+
+    providedBookingId = payload.get("bookingId")
+    if providedBookingId is not None:
         try:
-            booking_id = int(provided_booking_id)
+            bookingId = int(providedBookingId)
         except (TypeError, ValueError):
             return jsonify({"error": "bookingId must be an integer"}), 400
     else:
-        booking_id = int(time.time() * 1000) % 2147483647
+        bookingId = int(time.time() * 1000) % 2147483647
 
-    booking_payload = {
-        "id": booking_id,
-        "roomID": hold_data.get("roomID"),
-        "roomType": hold_data.get("roomType") or room_type,
-        "customerEmail": customer_email,
-        "customerMobile": customer_mobile,
-        "checkIn": hold_data.get("checkIn") or check_in,
-        "checkOut": hold_data.get("checkOut") or check_out,
+    bookingPayload = {
+        "id": bookingId,
+        "roomID": holdData.get("roomID"),
+        "roomType": holdData.get("roomType") or roomType,
+        "customerEmail": customerEmail,
+        "customerMobile": customerMobile,
+        "checkIn": holdData.get("checkIn") or checkIn,
+        "checkOut": holdData.get("checkOut") or checkOut,
         "amountSpent": amount,
-        "holdId": hold_id,
+        "holdId": holdId,
     }
 
-    missing_booking_fields = [
+    missingBookingFields = [
         key for key in [
             "roomID",
             "roomType",
@@ -608,77 +753,76 @@ def routeRoomsBookCard():
             "checkOut",
             "amountSpent",
             "holdId",
-        ] if booking_payload.get(key) in (None, "")
+        ] if bookingPayload.get(key) in (None, "")
     ]
-    if missing_booking_fields:
+    if missingBookingFields:
         return jsonify({
             "error": "Missing booking data for card booking",
-            "missingFields": missing_booking_fields,
-            "hold": hold_data,
+            "missingFields": missingBookingFields,
+            "hold": holdData,
         }), 400
 
-    room_update_payload = {
-        "holdId": hold_id,
+    roomUpdatePayload = {
+        "holdId": holdId,
         "status": "reserved",
-        "bookingId": booking_id,
+        "bookingId": bookingId,
         "reservationDate": payload.get("reservationDate"),
     }
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        bookings_future = executor.submit(
-            request_json,
+        bookingsFuture = executor.submit(
+            requestJson,
             "POST",
             f"{bookingsService}/bookings/create",
-            booking_payload,
+            bookingPayload,
         )
-        rooms_future = executor.submit(
-            request_json,
+        roomsFuture = executor.submit(
+            requestJson,
             "POST",
             f"{roomsService}/rooms/update",
-            room_update_payload,
+            roomUpdatePayload,
         )
 
-        bookings_status, bookings_data = bookings_future.result()
-        rooms_status, rooms_data = rooms_future.result()
+        bookingsStatus, bookingsData = bookingsFuture.result()
+        roomsStatus, roomsData = roomsFuture.result()
 
-    if bookings_status >= 400 or rooms_status >= 400:
+    if bookingsStatus >= 400 or roomsStatus >= 400:
         return jsonify({
             "error": "Card booking finalize failed",
-            "payment": card_data,
-            "bookings": {"statusCode": bookings_status, "data": bookings_data},
-            "rooms": {"statusCode": rooms_status, "data": rooms_data},
+            "payment": cardData,
+            "bookings": {"statusCode": bookingsStatus, "data": bookingsData},
+            "rooms": {"statusCode": roomsStatus, "data": roomsData},
         }), 502
 
-    loyalty_publish_error = None
+    loyaltyPublishError = None
     try:
-        amount_for_loyalty = int(float(booking_payload["amountSpent"]))
-        points = amount_for_loyalty // 10
-        loyalty_event = {
+        amountForLoyalty = int(float(bookingPayload["amountSpent"]))
+        points = amountForLoyalty // 10
+        loyaltyEvent = {
             "event": "booking_paid",
-            "email": booking_payload["customerEmail"],
-            "bookingId": str(booking_id),
-            "amount": amount_for_loyalty,
+            "email": bookingPayload["customerEmail"],
+            "bookingId": str(bookingId),
+            "amount": amountForLoyalty,
         }
-        get_redis_client().xadd(redisStream, {"data": json.dumps(loyalty_event)})
+        getRedisClient().xadd(redisStream, {"data": json.dumps(loyaltyEvent)})
     except Exception as exc:
         points = None
-        loyalty_publish_error = str(exc)
+        loyaltyPublishError = str(exc)
 
     return jsonify({
         "message": "Card booking finalized successfully",
-        "payment": card_data,
-        "booking": bookings_data,
-        "room": rooms_data,
+        "payment": cardData,
+        "booking": bookingsData,
+        "room": roomsData,
         "loyalty": {
             "event": "booking_paid",
-            "email": booking_payload["customerEmail"],
+            "email": bookingPayload["customerEmail"],
             "points": points,
-            "publishError": loyalty_publish_error,
+            "publishError": loyaltyPublishError,
         },
     }), 200
 
 
-# Scenario 1: step 2, after payment is successful, we can create the booking record and finalize the hold
 @app.post("/route-rooms/book/confirm")
 def routeRoomsConfirmBooking():
     """
@@ -686,22 +830,22 @@ def routeRoomsConfirmBooking():
     """
     payload = request.get_json(silent=True) or {}
 
-    intent_id = payload.get("intentID") or payload.get("paymentIntentId")
-    tx_hash = payload.get("TxnID_Proof") or payload.get("tx_hash")
-    hold_id_input = payload.get("holdID") or payload.get("holdId")
+    intentId = payload.get("intentID") or payload.get("paymentIntentId")
+    txHash = payload.get("TxnID_Proof") or payload.get("tx_hash")
+    holdIdInput = payload.get("holdID") or payload.get("holdId")
 
-    if not intent_id or not tx_hash or not hold_id_input:
+    if not intentId or not txHash or not holdIdInput:
         return jsonify({"error": "intentID, TxnID_Proof and holdID are required"}), 400
 
-    settle_payload = {
-        "paymentIntentId": intent_id,
-        "tx_hash": tx_hash,
+    settlePayload = {
+        "paymentIntentId": intentId,
+        "tx_hash": txHash,
     }
 
     try:
-        settle_resp = requests.post(
+        settleResp = requests.post(
             f"{paymentService}/payments/settle",
-            json=settle_payload,
+            json=settlePayload,
             headers={"Content-Type": "application/json"},
             timeout=forwardTimeout,
         )
@@ -711,51 +855,51 @@ def routeRoomsConfirmBooking():
         return jsonify({"error": "Payment service unavailable"}), 502
 
     try:
-        settle_data = settle_resp.json()
+        settleData = settleResp.json()
     except ValueError:
-        settle_data = {"message": settle_resp.text}
+        settleData = {"message": settleResp.text}
 
-    if settle_resp.status_code >= 400:
-        return jsonify({"settle": settle_data}), settle_resp.status_code
+    if settleResp.status_code >= 400:
+        return jsonify({"settle": settleData}), settleResp.status_code
 
-    if (settle_data.get("status") or "").upper() != "PAID":
-        return jsonify({"settle": settle_data, "error": "payment not marked as PAID"}), 400
+    if (settleData.get("status") or "").upper() != "PAID":
+        return jsonify({"settle": settleData, "error": "payment not marked as PAID"}), 400
 
-    booking_context = pendingBookings.get(intent_id, {})
+    bookingContext = pendingBookings.get(intentId, {})
 
-    hold_id = hold_id_input
-    cached_hold_id = booking_context.get("holdId")
-    if cached_hold_id and cached_hold_id != hold_id:
+    holdId = holdIdInput
+    cachedHoldId = bookingContext.get("holdId")
+    if cachedHoldId and cachedHoldId != holdId:
         return jsonify({
             "error": "holdID does not match booking context for this paymentIntentId",
-            "expectedHoldId": cached_hold_id,
-            "providedHoldId": hold_id,
+            "expectedHoldId": cachedHoldId,
+            "providedHoldId": holdId,
         }), 400
 
-    amount_spent = booking_context.get("amount") or payload.get("amount")
-    provided_booking_id = payload.get("bookingId")
-    if provided_booking_id is not None:
+    amountSpent = bookingContext.get("amount") or payload.get("amount")
+    providedBookingId = payload.get("bookingId")
+    if providedBookingId is not None:
         try:
-            booking_id = int(provided_booking_id)
+            bookingId = int(providedBookingId)
         except (TypeError, ValueError):
             return jsonify({"error": "bookingId must be an integer"}), 400
     else:
         # Keep id inside signed INT range used by downstream MySQL schemas.
-        booking_id = int(time.time() * 1000) % 2147483647
+        bookingId = int(time.time() * 1000) % 2147483647
 
-    booking_payload = {
-        "id": booking_id,
-        "roomID": booking_context.get("roomID") or payload.get("roomID"),
-        "roomType": booking_context.get("roomType") or payload.get("roomType"),
-        "customerEmail": booking_context.get("customerEmail") or payload.get("customerEmail"),
-        "customerMobile": booking_context.get("customerMobile") or payload.get("customerMobile"),
-        "checkIn": booking_context.get("checkIn") or payload.get("checkIn"),
-        "checkOut": booking_context.get("checkOut") or payload.get("checkOut"),
-        "amountSpent": amount_spent,
-        "holdId": hold_id,
+    bookingPayload = {
+        "id": bookingId,
+        "roomID": bookingContext.get("roomID") or payload.get("roomID"),
+        "roomType": bookingContext.get("roomType") or payload.get("roomType"),
+        "customerEmail": bookingContext.get("customerEmail") or payload.get("customerEmail"),
+        "customerMobile": bookingContext.get("customerMobile") or payload.get("customerMobile"),
+        "checkIn": bookingContext.get("checkIn") or payload.get("checkIn"),
+        "checkOut": bookingContext.get("checkOut") or payload.get("checkOut"),
+        "amountSpent": amountSpent,
+        "holdId": holdId,
     }
 
-    missing_booking_fields = [
+    missingBookingFields = [
         key for key in [
             "roomID",
             "roomType",
@@ -765,19 +909,19 @@ def routeRoomsConfirmBooking():
             "checkOut",
             "amountSpent",
             "holdId",
-        ] if booking_payload.get(key) in (None, "")
+        ] if bookingPayload.get(key) in (None, "")
     ]
-    if missing_booking_fields:
+    if missingBookingFields:
         return jsonify({
             "error": "Missing booking data for finalize step",
-            "missingFields": missing_booking_fields,
+            "missingFields": missingBookingFields,
             "hint": "Pass the fields in /route-rooms/book or include them in this confirm request",
         }), 400
 
-    room_update_payload = {
-        "holdId": hold_id,
+    roomUpdatePayload = {
+        "holdId": holdId,
         "status": payload.get("roomStatus", "reserved"),
-        "bookingId": booking_id,
+        "bookingId": bookingId,
         "reservationDate": payload.get("reservationDate"),
     }
 
@@ -790,80 +934,76 @@ def routeRoomsConfirmBooking():
                 timeout=forwardTimeout,
             )
             try:
-                body_data = response.json()
+                bodyData = response.json()
             except ValueError:
-                body_data = {"message": response.text}
-            return response.status_code, body_data
+                bodyData = {"message": response.text}
+            return response.status_code, bodyData
         except requests.Timeout:
             return 504, {"error": "Upstream timeout"}
         except requests.ConnectionError:
             return 502, {"error": "Upstream unavailable"}
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        bookings_future = executor.submit(
+        bookingsFuture = executor.submit(
             post_json,
             f"{bookingsService}/bookings/create",
-            booking_payload,
+            bookingPayload,
         )
-        rooms_future = executor.submit(
+        roomsFuture = executor.submit(
             post_json,
             f"{roomsService}/rooms/update",
-            room_update_payload,
+            roomUpdatePayload,
         )
 
-        bookings_status, bookings_data = bookings_future.result()
-        rooms_status, rooms_data = rooms_future.result()
+        bookingsStatus, bookingsData = bookingsFuture.result()
+        roomsStatus, roomsData = roomsFuture.result()
 
-    if bookings_status >= 400 or rooms_status >= 400:
+    if bookingsStatus >= 400 or roomsStatus >= 400:
         return jsonify({
-            "settle": settle_data,
-            "bookings": {"statusCode": bookings_status, "data": bookings_data},
-            "rooms": {"statusCode": rooms_status, "data": rooms_data},
+            "settle": settleData,
+            "bookings": {"statusCode": bookingsStatus, "data": bookingsData},
+            "rooms": {"statusCode": roomsStatus, "data": roomsData},
             "error": "Finalize step failed after payment settlement",
         }), 502
 
-    loyalty_publish_error = None
+    loyaltyPublishError = None
     try:
-        amount_for_loyalty = int(float(booking_payload["amountSpent"]))
-        points = amount_for_loyalty // 10
-        loyalty_event = {
+        amountForLoyalty = int(float(bookingPayload["amountSpent"]))
+        points = amountForLoyalty // 10
+        loyaltyEvent = {
             "event": "booking_paid",
-            "email": booking_payload["customerEmail"],
-            "bookingId": str(booking_id),
-            "amount": amount_for_loyalty,
+            "email": bookingPayload["customerEmail"],
+            "bookingId": str(bookingId),
+            "amount": amountForLoyalty,
         }
-        get_redis_client().xadd(
+        getRedisClient().xadd(
             redisStream,
-            {"data": json.dumps(loyalty_event)},
+            {"data": json.dumps(loyaltyEvent)},
         )
     except Exception as exc:
         points = None
-        loyalty_publish_error = str(exc)
+        loyaltyPublishError = str(exc)
 
-    pendingBookings.pop(intent_id, None)
+    pendingBookings.pop(intentId, None)
 
     return jsonify({
         "message": "Booking finalized successfully",
-        "settle": settle_data,
-        "booking": bookings_data,
-        "room": rooms_data,
+        "settle": settleData,
+        "booking": bookingsData,
+        "room": roomsData,
         "loyalty": {
             "event": "booking_paid",
-            "email": booking_payload["customerEmail"],
+            "email": bookingPayload["customerEmail"],
             "points": points,
-            "publishError": loyalty_publish_error,
+            "publishError": loyaltyPublishError,
         },
     }), 200
 
 
 
-# SCENARIO 2: CANCELLATION FLOW
+# Cancellation flow
 @app.post("/route-bookings/bookings/<int:booking_id>/cancel")
 def routeBookingsCancel(booking_id: int):
-    """
-    Cancel a booking by orchestrating refund, room release, booking delete,
-    notification queueing, and loyalty points deduction event.
-    """
     unauthorized = checkAuth()
     if unauthorized:
         return unauthorized
@@ -871,135 +1011,183 @@ def routeBookingsCancel(booking_id: int):
     payload = request.get_json(silent=True) or {}
     reason = str(payload.get("reason") or "BOOKING_CANCELLED")
     user = getUser() or {}
-    user_identifier = (user.get("username") or "").strip().lower()
-    user_role = str(user.get("role") or "").strip().lower()
+    userIdentifier = (user.get("username") or "").strip().lower()
+    userRole = str(user.get("role") or "").strip().lower()
 
-    booking_status, booking_data = request_json(
+    bookingStatus, bookingData = requestJson(
         "GET",
         f"{bookingsService}/bookings/{booking_id}",
     )
-    if booking_status >= 400:
+    if bookingStatus >= 400:
         return jsonify({
             "error": "Failed to retrieve booking before cancellation",
-            "bookings": {"statusCode": booking_status, "data": booking_data},
-        }), booking_status
+            "bookings": {"statusCode": bookingStatus, "data": bookingData},
+        }), bookingStatus
 
-    if not isinstance(booking_data, dict):
+    if not isinstance(bookingData, dict):
         return jsonify({"error": "Unexpected booking payload from bookings service"}), 502
 
-    hold_id = booking_data.get("hold_id") or booking_data.get("holdId")
-    amount_spent = booking_data.get("amount_spent") or booking_data.get("amountSpent")
-    customer_email = booking_data.get("customer_email") or booking_data.get("customerEmail")
-    room_type = booking_data.get("room_type") or booking_data.get("roomType") or "room"
-    check_in = booking_data.get("check_in") or booking_data.get("checkIn") or "N/A"
-    check_out = booking_data.get("check_out") or booking_data.get("checkOut") or "N/A"
+    holdId = bookingData.get("hold_id") or bookingData.get("holdId")
+    legacyHoldId = bookingData.get("legacy_hold_id") or bookingData.get("legacyHoldId")
+    amountSpent = bookingData.get("amount_spent") or bookingData.get("amountSpent")
+    customerEmail = bookingData.get("customer_email") or bookingData.get("customerEmail")
+    roomType = bookingData.get("room_type") or bookingData.get("roomType") or "room"
+    checkIn = bookingData.get("check_in") or bookingData.get("checkIn") or "N/A"
+    checkOut = bookingData.get("check_out") or bookingData.get("checkOut") or "N/A"
 
-    missing_fields = [
+    missingFields = [
         key
         for key, value in {
-            "holdId": hold_id,
-            "amountSpent": amount_spent,
-            "customerEmail": customer_email,
+            "holdId": holdId,
+            "amountSpent": amountSpent,
+            "customerEmail": customerEmail,
         }.items()
         if value in (None, "")
     ]
-    if missing_fields:
+    if missingFields:
         return jsonify({
             "error": "Booking record is missing required cancellation fields",
-            "missingFields": missing_fields,
-            "booking": booking_data,
+            "missingFields": missingFields,
+            "booking": bookingData,
         }), 502
 
-    booking_owner = str(customer_email).strip().lower()
-    if user_role != "admin" and booking_owner != user_identifier:
+    bookingOwner = str(customerEmail).strip().lower()
+    if userRole != "admin" and bookingOwner != userIdentifier:
         return jsonify({
             "error": "Forbidden: booking does not belong to the authenticated user",
             "bookingId": booking_id,
-            "bookingOwner": customer_email,
+            "bookingOwner": customerEmail,
             "authenticatedUser": user.get("username"),
         }), 403
 
-    refund_payload = {
-        "holdId": hold_id,
-        "amount": amount_spent,
-        "reason": reason,
-    }
-    room_update_payload = {
-        "holdId": hold_id,
-        "status": "available",
-    }
+    try:
+        amountSpentInt = int(float(amountSpent))
+    except (TypeError, ValueError):
+        return jsonify({"error": "amountSpent must be numeric in booking record"}), 502
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        refund_future = executor.submit(
-            request_json,
-            "POST",
-            f"{paymentService}/payments/refund",
-            refund_payload,
-        )
-        rooms_future = executor.submit(
-            request_json,
-            "POST",
-            f"{roomsService}/rooms/update",
-            room_update_payload,
-        )
+    refundHoldIds = [str(holdId)]
+    if legacyHoldId and str(legacyHoldId) != str(holdId):
+        refundHoldIds.append(str(legacyHoldId))
 
-        refund_status, refund_data = refund_future.result()
-        rooms_status, rooms_data = rooms_future.result()
-
-    if refund_status >= 400 or rooms_status >= 400:
+    refundPlan, refundPlanError, planWarnings = computeRefundSplit(refundHoldIds, amountSpentInt)
+    if refundPlanError:
         return jsonify({
-            "error": "Cancellation failed during refund or room update",
-            "booking": booking_data,
-            "refund": {"statusCode": refund_status, "data": refund_data},
-            "rooms": {"statusCode": rooms_status, "data": rooms_data},
+            "error": "Cancellation failed while planning refund reconciliation",
+            "booking": bookingData,
+            "details": refundPlanError,
         }), 502
 
-    delete_status, delete_data = request_json(
+    refundResults = []
+    for step in (refundPlan or {}).get("split", []):
+        refundPayload = {
+            "holdId": step["holdId"],
+            "amount": step["amount"],
+            "reason": reason,
+        }
+        refundStatus, refundData = requestJson(
+            "POST",
+            f"{paymentService}/payments/refund",
+            refundPayload,
+        )
+        refundResults.append({
+            "holdId": step["holdId"],
+            "requestedAmount": step["amount"],
+            "statusCode": refundStatus,
+            "data": refundData,
+        })
+
+        if refundStatus >= 400:
+            return jsonify({
+                "error": "Cancellation failed during reconciled refund",
+                "booking": bookingData,
+                "refundPlan": refundPlan,
+                "refundAttempt": refundResults,
+            }), 502
+
+    refundSummary = {
+        "strategy": "reconciled_by_hold",
+        "targetAmount": amountSpentInt,
+        "holdIds": refundHoldIds,
+        "plan": refundPlan,
+        "attempts": refundResults,
+    }
+
+    roomUpdatePayload = {
+        "holdId": holdId,
+        "status": "available",
+    }
+    roomsStatus, roomsData = requestJson(
+        "POST",
+        f"{roomsService}/rooms/update",
+        roomUpdatePayload,
+    )
+
+    roomsErrorText = ""
+    if isinstance(roomsData, dict):
+        roomsErrorText = str(roomsData.get("error") or roomsData.get("message") or "").strip().lower()
+
+    roomAlreadyMissing = roomsStatus == 404 and "room not found for given holdid" in roomsErrorText
+    if roomsStatus >= 400 and not roomAlreadyMissing:
+        return jsonify({
+            "error": "Cancellation failed during refund or room update",
+            "booking": bookingData,
+            "refund": refundSummary,
+            "rooms": {"statusCode": roomsStatus, "data": roomsData},
+        }), 502
+
+    cancellationWarnings = list(planWarnings or [])
+    if (refundPlan or {}).get("shortfall", 0) > 0:
+        cancellationWarnings.append(
+            f"Refund shortfall remains: {(refundPlan or {}).get('shortfall')} after reconciliation"
+        )
+    if roomAlreadyMissing:
+        cancellationWarnings.append("Room holdId not found; treated as already released")
+
+    deleteStatus, deleteData = requestJson(
         "DELETE",
         f"{bookingsService}/bookings/{booking_id}",
     )
-    if delete_status >= 400:
+    if deleteStatus >= 400:
         return jsonify({
             "error": "Booking cancellation partially completed; booking delete failed",
-            "booking": booking_data,
-            "refund": {"statusCode": refund_status, "data": refund_data},
-            "rooms": {"statusCode": rooms_status, "data": rooms_data},
-            "bookingsDelete": {"statusCode": delete_status, "data": delete_data},
+            "booking": bookingData,
+            "refund": refundSummary,
+            "rooms": {"statusCode": roomsStatus, "data": roomsData},
+            "bookingsDelete": {"statusCode": deleteStatus, "data": deleteData},
         }), 502
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        notification_future = executor.submit(
-            enqueue_cancellation_email,
-            customer_email,
+        notificationFuture = executor.submit(
+            enqueueCancellationEmail,
+            customerEmail,
             booking_id,
-            room_type,
-            check_in,
-            check_out,
+            roomType,
+            checkIn,
+            checkOut,
         )
-        loyalty_future = executor.submit(
-            publish_booking_cancelled_event,
-            customer_email,
+        loyaltyFuture = executor.submit(
+            publishBookingCancelledEvent,
+            customerEmail,
             booking_id,
-            amount_spent,
+            amountSpent,
         )
 
-        notification_result = notification_future.result()
-        loyalty_result = loyalty_future.result()
+        notificationResult = notificationFuture.result()
+        loyaltyResult = loyaltyFuture.result()
 
     return jsonify({
         "message": "Booking cancelled successfully",
-        "booking": booking_data,
-        "refund": refund_data,
-        "room": rooms_data,
-        "bookingsDelete": delete_data,
-        "notification": notification_result,
-        "loyalty": loyalty_result,
+        "booking": bookingData,
+        "refund": refundSummary,
+        "room": roomsData,
+        "warnings": cancellationWarnings,
+        "bookingsDelete": deleteData,
+        "notification": notificationResult,
+        "loyalty": loyaltyResult,
     }), 200
 
 
-# ═══════════════════════════════════════════════════════════════════════════════════
-# SCENARIO 3: BOOKING MODIFICATION FLOW (Step 1 & 2: Preview → Confirm)
-# ═══════════════════════════════════════════════════════════════════════════════════
+# Modification flow
 
 @app.post("/route-rooms/modify")
 def routeRoomsModifyPreview():
@@ -1014,106 +1202,148 @@ def routeRoomsModifyPreview():
         return unauthorized
 
     payload = request.get_json(silent=True) or {}
-    old_booking_id = payload.get("old_booking_id")
-    new_room_type = payload.get("new_room_type")
-    new_check_in = payload.get("new_check_in")
-    new_check_out = payload.get("new_check_out")
+    oldBookingId = payload.get("old_booking_id")
+    newRoomType = payload.get("new_room_type")
+    newCheckIn = payload.get("new_check_in")
+    newCheckOut = payload.get("new_check_out")
     user = getUser() or {}
-    user_identifier = (user.get("username") or "").strip().lower()
-    user_role = str(user.get("role") or "").strip().lower()
+    userIdentifier = (user.get("username") or "").strip().lower()
+    userRole = str(user.get("role") or "").strip().lower()
 
-    if not old_booking_id or not new_room_type or not new_check_in or not new_check_out:
+    if not oldBookingId or not newRoomType or not newCheckIn or not newCheckOut:
         return jsonify({
             "error": "old_booking_id, new_room_type, new_check_in, new_check_out are required"
         }), 400
 
-    booking_status, booking_data = request_json(
+    bookingStatus, bookingData = requestJson(
         "GET",
-        f"{bookingsService}/bookings/{old_booking_id}",
+        f"{bookingsService}/bookings/{oldBookingId}",
     )
-    if booking_status >= 400:
+    if bookingStatus >= 400:
         return jsonify({
             "error": "Failed to retrieve old booking",
-            "bookings": {"statusCode": booking_status, "data": booking_data},
-        }), booking_status
+            "bookings": {"statusCode": bookingStatus, "data": bookingData},
+        }), bookingStatus
 
-    if not isinstance(booking_data, dict):
+    if not isinstance(bookingData, dict):
         return jsonify({"error": "Unexpected booking payload"}), 502
 
-    old_hold_id = booking_data.get("hold_id") or booking_data.get("holdId")
-    old_amount_spent = booking_data.get("amount_spent") or booking_data.get("amountSpent")
-    customer_email = booking_data.get("customer_email") or booking_data.get("customerEmail")
-    old_room_type = booking_data.get("room_type") or booking_data.get("roomType")
+    oldHoldId = bookingData.get("hold_id") or bookingData.get("holdId")
+    oldAmountSpent = bookingData.get("amount_spent") or bookingData.get("amountSpent")
+    customerEmail = bookingData.get("customer_email") or bookingData.get("customerEmail")
+    oldRoomType = bookingData.get("room_type") or bookingData.get("roomType")
 
-    if not old_hold_id or old_amount_spent is None or not customer_email:
+    if not oldHoldId or oldAmountSpent is None or not customerEmail:
         return jsonify({
             "error": "Old booking missing required fields for modification",
             "missingFields": [k for k in ["holdId", "amountSpent", "customerEmail"] 
-                            if booking_data.get(k) is None]
+                            if bookingData.get(k) is None]
         }), 502
 
-    booking_owner = str(customer_email).strip().lower()
-    if user_role != "admin" and booking_owner != user_identifier:
+    bookingOwner = str(customerEmail).strip().lower()
+    if userRole != "admin" and bookingOwner != userIdentifier:
         return jsonify({
             "error": "Forbidden: booking does not belong to the authenticated user",
-            "bookingId": old_booking_id,
-            "bookingOwner": customer_email,
+            "bookingId": oldBookingId,
+            "bookingOwner": customerEmail,
             "authenticatedUser": user.get("username"),
         }), 403
 
-    new_hold_payload = {
-        "roomType": new_room_type,
-        "checkIn": new_check_in,
-        "checkOut": new_check_out,
-        "customerEmail": customer_email,
-        "customerMobile": booking_data.get("customer_mobile") or booking_data.get("customerMobile"),
+    # Normalize date strings before calling rooms service.
+    normalizedCheckIn = normalizeDateString(newCheckIn)
+    normalizedCheckOut = normalizeDateString(newCheckOut)
+    
+    if not normalizedCheckIn or not normalizedCheckOut:
+        return jsonify({
+            "error": "Invalid date format for check-in or check-out",
+            "received": {
+                "new_check_in": newCheckIn,
+                "new_check_out": newCheckOut,
+            },
+            "expected_format": "YYYY-MM-DD or RFC format (e.g., 'Wed, 25 Mar 2026 00:00:00 GMT')"
+        }), 400
+
+    # Release old hold before creating new hold.
+    oldReleasePayload = {
+        "holdId": oldHoldId,
+        "status": "available",
+    }
+    oldReleaseStatus, oldReleaseData = requestJson(
+        "POST",
+        f"{roomsService}/rooms/update",
+        oldReleasePayload,
+    )
+    if oldReleaseStatus >= 400:
+        return jsonify({
+            "error": "Failed to release old hold for modification",
+            "rooms": {"statusCode": oldReleaseStatus, "data": oldReleaseData},
+        }), oldReleaseStatus
+
+    newHoldPayload = {
+        "roomType": newRoomType,
+        "checkIn": normalizedCheckIn,
+        "checkOut": normalizedCheckOut,
+        "customerEmail": customerEmail,
+        "customerMobile": bookingData.get("customer_mobile") or bookingData.get("customerMobile"),
     }
 
-    new_hold_status, new_hold_data = request_json(
+    newHoldStatus, newHoldData = requestJson(
         "POST",
         f"{roomsService}/rooms/holds",
-        new_hold_payload,
+        newHoldPayload,
     )
-    if new_hold_status >= 400:
+    if newHoldStatus >= 400:
+        # Re-establish old hold if new hold creation fails.
+        reHoldPayload = {
+            "holdId": oldHoldId,
+            "status": "held",
+        }
+        requestJson(
+            "POST",
+            f"{roomsService}/rooms/update",
+            reHoldPayload,
+        )
         return jsonify({
             "error": "Failed to create new hold for proposed modification",
-            "rooms": {"statusCode": new_hold_status, "data": new_hold_data},
-        }), new_hold_status
+            "rooms": {"statusCode": newHoldStatus, "data": newHoldData},
+            "sentPayload": newHoldPayload,
+            "recoveryAttempted": "Old hold has been re-established",
+        }), newHoldStatus
 
-    new_hold_id = new_hold_data.get("holdId")
-    new_amount = new_hold_data.get("amount")
+    newHoldId = newHoldData.get("holdId")
+    newAmount = newHoldData.get("amount")
 
-    if not new_hold_id or new_amount is None:
+    if not newHoldId or newAmount is None:
         return jsonify({
             "error": "New hold response missing required fields"
         }), 502
 
-    old_amount = int(float(old_amount_spent))
-    new_amount_int = int(float(new_amount))
-    difference = new_amount_int - old_amount
-    loyalty_delta = difference // 10
+    oldAmount = int(float(oldAmountSpent))
+    newAmountInt = int(float(newAmount))
+    difference = newAmountInt - oldAmount
+    loyaltyDelta = difference // 10
 
     return jsonify({
         "message": "Modification preview generated successfully",
         "old_booking": {
-            "bookingId": old_booking_id,
-            "roomType": old_room_type,
-            "cost": old_amount,
-            "holdId": old_hold_id,
+            "bookingId": oldBookingId,
+            "roomType": oldRoomType,
+            "cost": oldAmount,
+            "holdId": oldHoldId,
         },
         "new_booking": {
-            "roomType": new_room_type,
-            "cost": new_amount_int,
-            "holdId": new_hold_id,
-            "checkIn": new_check_in,
-            "checkOut": new_check_out,
+            "roomType": newRoomType,
+            "cost": newAmountInt,
+            "holdId": newHoldId,
+            "checkIn": newCheckIn,
+            "checkOut": newCheckOut,
         },
         "price_adjustment": {
-            "old_cost": old_amount,
-            "new_cost": new_amount_int,
+            "old_cost": oldAmount,
+            "new_cost": newAmountInt,
             "difference": difference,
             "action": "charge" if difference > 0 else ("refund" if difference < 0 else "none"),
-            "loyalty_delta_points": loyalty_delta,
+            "loyalty_delta_points": loyaltyDelta,
         },
     }), 200
 
@@ -1133,142 +1363,164 @@ def routeRoomsConfirmModification():
         return unauthorized
 
     payload = request.get_json(silent=True) or {}
-    old_booking_id = payload.get("old_booking_id")
-    new_booking_id = payload.get("new_booking_id")
-    old_hold_id_input = payload.get("old_hold_id")
-    new_hold_id = payload.get("new_hold_id")
-    card_number = payload.get("card_number")
+    oldBookingId = payload.get("old_booking_id")
+    newBookingId = payload.get("new_booking_id")
+    oldHoldIdInput = payload.get("old_hold_id")
+    newHoldId = payload.get("new_hold_id")
+    cardNumber = payload.get("card_number")
     user = getUser() or {}
-    user_identifier = (user.get("username") or "").strip().lower()
-    user_role = str(user.get("role") or "").strip().lower()
+    userIdentifier = (user.get("username") or "").strip().lower()
+    userRole = str(user.get("role") or "").strip().lower()
 
-    if not old_booking_id or not new_hold_id:
+    if not oldBookingId or not newHoldId:
         return jsonify({
             "error": "old_booking_id and new_hold_id are required"
         }), 400
 
-    booking_status, booking_data = request_json(
+    bookingStatus, bookingData = requestJson(
         "GET",
-        f"{bookingsService}/bookings/{old_booking_id}",
+        f"{bookingsService}/bookings/{oldBookingId}",
     )
-    if booking_status >= 400:
+    if bookingStatus >= 400:
         return jsonify({
             "error": "Failed to retrieve old booking",
-            "bookings": {"statusCode": booking_status, "data": booking_data},
-        }), booking_status
+            "bookings": {"statusCode": bookingStatus, "data": bookingData},
+        }), bookingStatus
 
-    if not isinstance(booking_data, dict):
+    if not isinstance(bookingData, dict):
         return jsonify({"error": "Unexpected booking payload"}), 502
 
-    customer_email = booking_data.get("customer_email") or booking_data.get("customerEmail")
-    old_amount_spent = booking_data.get("amount_spent") or booking_data.get("amountSpent")
-    old_hold_id = booking_data.get("hold_id") or booking_data.get("holdId")
+    customerEmail = bookingData.get("customer_email") or bookingData.get("customerEmail")
+    oldAmountSpent = bookingData.get("amount_spent") or bookingData.get("amountSpent")
+    oldHoldId = bookingData.get("hold_id") or bookingData.get("holdId")
 
-    if not customer_email or old_amount_spent is None or not old_hold_id:
+    if not customerEmail or oldAmountSpent is None or not oldHoldId:
         return jsonify({
             "error": "Old booking missing required fields for modification",
-            "booking": booking_data,
+            "booking": bookingData,
         }), 502
 
-    if old_hold_id_input and str(old_hold_id_input) != str(old_hold_id):
+    if oldHoldIdInput and str(oldHoldIdInput) != str(oldHoldId):
         return jsonify({
             "error": "old_hold_id does not match booking record",
-            "providedOldHoldId": old_hold_id_input,
-            "expectedOldHoldId": old_hold_id,
+            "providedOldHoldId": oldHoldIdInput,
+            "expectedOldHoldId": oldHoldId,
         }), 400
 
-    booking_owner = str(customer_email).strip().lower()
-    if user_role != "admin" and booking_owner != user_identifier:
+    bookingOwner = str(customerEmail).strip().lower()
+    if userRole != "admin" and bookingOwner != userIdentifier:
         return jsonify({
             "error": "Forbidden: booking does not belong to the authenticated user",
-            "bookingId": old_booking_id,
+            "bookingId": oldBookingId,
         }), 403
 
-    new_amount_spent = payload.get("new_amount_spent")
-    if new_amount_spent is None:
+    newAmountSpent = payload.get("new_amount_spent")
+    if newAmountSpent is None:
         return jsonify({
             "error": "new_amount_spent is required. Use /route-rooms/modify response value."
         }), 400
 
     try:
-        new_amount_spent = int(float(new_amount_spent))
+        newAmountSpent = int(float(newAmountSpent))
     except (TypeError, ValueError):
         return jsonify({"error": "new_amount_spent must be numeric"}), 400
 
-    if new_amount_spent <= 0:
+    if newAmountSpent <= 0:
         return jsonify({"error": "new_amount_spent must be positive"}), 400
 
-    old_amount = int(float(old_amount_spent))
-    difference = new_amount_spent - old_amount
-    loyalty_delta = difference // 10
+    oldAmount = int(float(oldAmountSpent))
+    difference = newAmountSpent - oldAmount
+    loyaltyDelta = difference // 10
 
-    settle_payment_status = None
-    settle_payment_data = None
-    refund_status = None
-    refund_data = None
+    settlePaymentStatus = None
+    settlePaymentData = None
+    refundStatus = None
+    refundData = None
 
     if difference > 0:
-        if not card_number:
+        if not cardNumber:
             return jsonify({
                 "error": "card_number required for additional payment",
                 "difference": difference,
             }), 400
 
-        settle_payload = {
-            "holdId": new_hold_id,
+        settlePayload = {
+            "holdId": newHoldId,
             "amount": difference,
-            "card_number": card_number,
+            "card_number": cardNumber,
         }
-        settle_payment_status, settle_payment_data = request_json(
+        settlePaymentStatus, settlePaymentData = requestJson(
             "POST",
             f"{paymentService}/payments/settle-card",
-            settle_payload,
+            settlePayload,
         )
-        if settle_payment_status >= 400:
+        if settlePaymentStatus >= 400:
             return jsonify({
                 "error": "Payment settlement failed",
-                "payment": {"statusCode": settle_payment_status, "data": settle_payment_data},
+                "payment": {"statusCode": settlePaymentStatus, "data": settlePaymentData},
             }), 502
 
-        if (settle_payment_data.get("status") or "").upper() != "PAID":
+        if (settlePaymentData.get("status") or "").upper() != "PAID":
             return jsonify({
                 "error": "Payment not marked as PAID",
-                "payment": settle_payment_data,
+                "payment": settlePaymentData,
             }), 400
 
     elif difference < 0:
-        refund_payload = {
-            "holdId": old_hold_id,
+        refundPayload = {
+            "holdId": oldHoldId,
             "amount": abs(difference),
             "reason": "BOOKING_MODIFIED",
         }
-        refund_status, refund_data = request_json(
+        refundStatus, refundData = requestJson(
             "POST",
             f"{paymentService}/payments/refund",
-            refund_payload,
+            refundPayload,
         )
-        if refund_status >= 400:
+        if refundStatus >= 400:
             return jsonify({
                 "error": "Refund issuance failed",
-                "refund": {"statusCode": refund_status, "data": refund_data},
+                "refund": {"statusCode": refundStatus, "data": refundData},
             }), 502
 
-    if not new_booking_id:
-        new_booking_id = int(time.time() * 1000) % 2147483647
+    if not newBookingId:
+        newBookingId = int(time.time() * 1000) % 2147483647
 
-    new_booking_payload = {
-        "id": new_booking_id,
-        "roomID": payload.get("roomID") or booking_data.get("room_id") or booking_data.get("roomID"),
-        "roomType": payload.get("new_room_type") or booking_data.get("room_type") or booking_data.get("roomType"),
-        "customerEmail": customer_email,
-        "customerMobile": booking_data.get("customer_mobile") or booking_data.get("customerMobile"),
-        "checkIn": payload.get("new_check_in"),
-        "checkOut": payload.get("new_check_out"),
-        "amountSpent": new_amount_spent,
-        "holdId": new_hold_id,
+    # Normalize date strings for the booking payload.
+    normalizedCheckIn = normalizeDateString(payload.get("new_check_in"))
+    normalizedCheckOut = normalizeDateString(payload.get("new_check_out"))
+    
+    if not normalizedCheckIn or not normalizedCheckOut:
+        return jsonify({
+            "error": "new_check_in and new_check_out are required in confirm step",
+            "received": {
+                "new_check_in": payload.get("new_check_in"),
+                "new_check_out": payload.get("new_check_out"),
+            }
+        }), 400
+
+    # Resolve room details for the new hold.
+    roomContext = getHoldContextFromRooms(newHoldId)
+    roomId = roomContext.get("roomID") or payload.get("roomID")
+    if not roomId:
+        roomId = bookingData.get("room_id") or bookingData.get("roomID")
+
+    newRoomType = payload.get("new_room_type") or bookingData.get("room_type") or bookingData.get("roomType")
+
+    newBookingPayload = {
+        "id": newBookingId,
+        "roomID": roomId,
+        "roomType": newRoomType,
+        "customerEmail": customerEmail,
+        "customerMobile": bookingData.get("customer_mobile") or bookingData.get("customerMobile"),
+        "checkIn": normalizedCheckIn,
+        "checkOut": normalizedCheckOut,
+        "amountSpent": newAmountSpent,
+        "holdId": newHoldId,
+        "legacyHoldId": oldHoldId,
     }
 
-    missing_booking_fields = [
+    missingBookingFields = [
         key for key in [
             "roomID",
             "roomType",
@@ -1278,79 +1530,67 @@ def routeRoomsConfirmModification():
             "checkOut",
             "amountSpent",
             "holdId",
-        ] if new_booking_payload.get(key) in (None, "")
+        ] if newBookingPayload.get(key) in (None, "")
     ]
-    if missing_booking_fields:
+    if missingBookingFields:
         return jsonify({
             "error": "Missing required booking fields for modification confirm",
-            "missingFields": missing_booking_fields,
+            "missingFields": missingBookingFields,
         }), 400
 
-    room_release_payload = {
-        "holdId": old_hold_id,
-        "status": "available",
-    }
-
-    room_confirm_payload = {
-        "holdId": new_hold_id,
+    roomConfirmPayload = {
+        "holdId": newHoldId,
         "status": "reserved",
-        "bookingId": new_booking_id,
+        "bookingId": newBookingId,
     }
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        new_booking_future = executor.submit(
-            request_json,
+    # Old hold is released during preview; confirm only the new booking and hold.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        newBookingFuture = executor.submit(
+            requestJson,
             "POST",
             f"{bookingsService}/bookings/create",
-            new_booking_payload,
+            newBookingPayload,
         )
-        room_release_future = executor.submit(
-            request_json,
+        roomConfirmFuture = executor.submit(
+            requestJson,
             "POST",
             f"{roomsService}/rooms/update",
-            room_release_payload,
-        )
-        room_confirm_future = executor.submit(
-            request_json,
-            "POST",
-            f"{roomsService}/rooms/update",
-            room_confirm_payload,
+            roomConfirmPayload,
         )
 
-        new_booking_status, new_booking_data = new_booking_future.result()
-        room_release_status, room_release_data = room_release_future.result()
-        room_confirm_status, room_confirm_data = room_confirm_future.result()
+        newBookingStatus, newBookingData = newBookingFuture.result()
+        roomConfirmStatus, roomConfirmData = roomConfirmFuture.result()
 
-    if new_booking_status >= 400 or room_release_status >= 400 or room_confirm_status >= 400:
+    if newBookingStatus >= 400 or roomConfirmStatus >= 400:
         return jsonify({
             "error": "Modification failed during booking/room updates",
-            "new_booking": {"statusCode": new_booking_status, "data": new_booking_data},
-            "room_release": {"statusCode": room_release_status, "data": room_release_data},
-            "room_confirm": {"statusCode": room_confirm_status, "data": room_confirm_data},
+            "new_booking": {"statusCode": newBookingStatus, "data": newBookingData},
+            "room_confirm": {"statusCode": roomConfirmStatus, "data": roomConfirmData},
         }), 502
 
-    delete_old_booking_status, delete_old_booking_data = request_json(
+    deleteOldBookingStatus, deleteOldBookingData = requestJson(
         "DELETE",
-        f"{bookingsService}/bookings/{old_booking_id}",
+        f"{bookingsService}/bookings/{oldBookingId}",
     )
-    if delete_old_booking_status >= 400:
+    if deleteOldBookingStatus >= 400:
         return jsonify({
             "error": "Old booking deletion failed after modification",
-            "new_booking": {"statusCode": new_booking_status, "data": new_booking_data},
-            "delete_old": {"statusCode": delete_old_booking_status, "data": delete_old_booking_data},
+            "new_booking": {"statusCode": newBookingStatus, "data": newBookingData},
+            "delete_old": {"statusCode": deleteOldBookingStatus, "data": deleteOldBookingData},
         }), 502
 
     loyalty_event = {
         "event": "booking_modified",
-        "email": customer_email,
-        "bookingId": str(new_booking_id),
-        "old_amount": old_amount,
-        "new_amount": new_amount_spent,
+        "email": customerEmail,
+        "bookingId": str(newBookingId),
+        "old_amount": oldAmount,
+        "new_amount": newAmountSpent,
     }
     
     loyalty_publish_error = None
     try:
-        get_redis_client().xadd(
+        getRedisClient().xadd(
             redisStream,
             {"data": json.dumps(loyalty_event)},
         )
@@ -1360,36 +1600,32 @@ def routeRoomsConfirmModification():
     return jsonify({
         "message": "Booking modified successfully",
         "old_booking": {
-            "bookingId": old_booking_id,
-            "cost": old_amount,
+            "bookingId": oldBookingId,
+            "cost": oldAmount,
         },
-        "new_booking": new_booking_data,
+        "new_booking": newBookingData,
         "payment_settlement": {
             "difference": difference,
             "action": "charge" if difference > 0 else ("refund" if difference < 0 else "none"),
-            "payment": settle_payment_data if difference > 0 else None,
-            "refund": refund_data if difference < 0 else None,
+            "payment": settlePaymentData if difference > 0 else None,
+            "refund": refundData if difference < 0 else None,
         },
         "rooms": {
-            "old_released": room_release_data,
-            "new_confirmed": room_confirm_data,
+            "old_released": None,
+            "new_confirmed": roomConfirmData,
         },
         "loyalty": {
             "event": "booking_modified",
-            "email": customer_email,
-            "old_amount": old_amount,
-            "new_amount": new_amount_spent,
-            "points_delta": loyalty_delta,
+            "email": customerEmail,
+            "old_amount": oldAmount,
+            "new_amount": newAmountSpent,
+            "points_delta": loyaltyDelta,
             "publishError": loyalty_publish_error,
         },
     }), 200
 
 
-# ═══════════════════════════════════════════════════════════════════════════════════
-# SUPPORT & UTILITY ENDPOINTS (Used by scenarios, safe to keep)
-# ═══════════════════════════════════════════════════════════════════════════════════
-
-# Helper endpoints to route to bookings service for booking retrieval, creation, update and deletion.
+# Support and utility endpoints
 @app.get("/route-bookings/bookings/<int:booking_id>")
 def routeBookingsGet(booking_id: int):
     """
@@ -1415,7 +1651,7 @@ def routeBookingsMine():
     if not user_identifier:
         return jsonify({"error": "Authenticated user missing email/username"}), 400
 
-    status_code, data = request_json(
+    status_code, data = requestJson(
         "GET",
         f"{bookingsService}/bookings",
         params={"customerEmail": user_identifier},
@@ -1457,86 +1693,86 @@ def routePaymentSettleCard():
     Settle a card payment and auto-finalize booking when hold context is available.
     """
     payload = request.get_json(silent=True) or {}
-    hold_id = payload.get("holdId")
+    holdId = payload.get("holdId")
     amount = payload.get("amount")
-    card_number = payload.get("card_number")
-    customer_email = str(payload.get("customerEmail") or "").strip()
-    customer_mobile = str(payload.get("customerMobile") or "").strip()
+    cardNumber = payload.get("card_number")
+    customerEmail = str(payload.get("customerEmail") or "").strip()
+    customerMobile = str(payload.get("customerMobile") or "").strip()
 
-    if not hold_id:
+    if not holdId:
         return jsonify({"error": "holdId is required"}), 400
     if amount is None:
         return jsonify({"error": "amount is required"}), 400
-    if not card_number:
+    if not cardNumber:
         return jsonify({"error": "card_number is required"}), 400
-    if not customer_email:
+    if not customerEmail:
         return jsonify({"error": "customerEmail is required"}), 400
-    if not customer_mobile:
+    if not customerMobile:
         return jsonify({"error": "customerMobile is required"}), 400
 
-    context = pendingCardBookings.get(str(hold_id), {}).copy()
+    context = pendingCardBookings.get(str(holdId), {}).copy()
     if not context:
-        context = get_hold_context_from_rooms(hold_id)
+        context = getHoldContextFromRooms(holdId)
 
-    settle_amount = amount
-    context_amount = context.get("amount")
-    if context_amount is not None:
+    settleAmount = amount
+    contextAmount = context.get("amount")
+    if contextAmount is not None:
         try:
-            requested_amount = int(float(amount))
-            expected_amount = int(float(context_amount))
+            requestedAmount = int(float(amount))
+            expectedAmount = int(float(contextAmount))
         except (TypeError, ValueError):
             return jsonify({"error": "amount must be numeric"}), 400
 
-        if requested_amount != expected_amount:
+        if requestedAmount != expectedAmount:
             return jsonify({
                 "error": "amount does not match hold amount",
-                "requestedAmount": requested_amount,
-                "expectedAmount": expected_amount,
-                "holdId": hold_id,
+                "requestedAmount": requestedAmount,
+                "expectedAmount": expectedAmount,
+                "holdId": holdId,
             }), 400
 
-        settle_amount = expected_amount
+        settleAmount = expectedAmount
 
-    settle_status, settle_data = request_json(
+    settleStatus, settleData = requestJson(
         "POST",
         f"{paymentService}/payments/settle-card",
         {
-            "holdId": hold_id,
-            "amount": settle_amount,
-            "card_number": card_number,
+            "holdId": holdId,
+            "amount": settleAmount,
+            "card_number": cardNumber,
         },
     )
-    if settle_status >= 400:
-        return jsonify(settle_data), settle_status
+    if settleStatus >= 400:
+        return jsonify(settleData), settleStatus
 
-    if (settle_data.get("status") or "").upper() != "PAID":
+    if (settleData.get("status") or "").upper() != "PAID":
         return jsonify({
             "error": "Card payment not marked as PAID",
-            "payment": settle_data,
+            "payment": settleData,
         }), 400
 
-    provided_booking_id = payload.get("bookingId")
-    if provided_booking_id is not None:
+    providedBookingId = payload.get("bookingId")
+    if providedBookingId is not None:
         try:
-            booking_id = int(provided_booking_id)
+            bookingId = int(providedBookingId)
         except (TypeError, ValueError):
             return jsonify({"error": "bookingId must be an integer"}), 400
     else:
-        booking_id = int(time.time() * 1000) % 2147483647
+        bookingId = int(time.time() * 1000) % 2147483647
 
-    booking_payload = {
-        "id": booking_id,
+    bookingPayload = {
+        "id": bookingId,
         "roomID": payload.get("roomID") or context.get("roomID"),
         "roomType": payload.get("roomType") or context.get("roomType"),
-        "customerEmail": customer_email,
-        "customerMobile": customer_mobile,
+        "customerEmail": customerEmail,
+        "customerMobile": customerMobile,
         "checkIn": payload.get("checkIn") or context.get("checkIn"),
         "checkOut": payload.get("checkOut") or context.get("checkOut"),
         "amountSpent": payload.get("amountSpent") or context.get("amount") or amount,
-        "holdId": hold_id,
+        "holdId": holdId,
     }
 
-    missing_booking_fields = [
+    missingBookingFields = [
         key for key in [
             "roomID",
             "roomType",
@@ -1546,76 +1782,76 @@ def routePaymentSettleCard():
             "checkOut",
             "amountSpent",
             "holdId",
-        ] if booking_payload.get(key) in (None, "")
+        ] if bookingPayload.get(key) in (None, "")
     ]
-    if missing_booking_fields:
+    if missingBookingFields:
         return jsonify({
             "message": "Payment settled, but booking was not auto-created due to missing fields",
-            "payment": settle_data,
+            "payment": settleData,
             "autoBookingCreated": False,
-            "missingFields": missing_booking_fields,
+            "missingFields": missingBookingFields,
             "hint": "Pass complete booking fields in settle-card request (customerEmail/customerMobile are now mandatory)",
         }), 202
 
-    room_update_payload = {
-        "holdId": hold_id,
+    roomUpdatePayload = {
+        "holdId": holdId,
         "status": payload.get("roomStatus", "reserved"),
-        "bookingId": booking_id,
+        "bookingId": bookingId,
         "reservationDate": payload.get("reservationDate"),
     }
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        bookings_future = executor.submit(
-            request_json,
+        bookingsFuture = executor.submit(
+            requestJson,
             "POST",
             f"{bookingsService}/bookings/create",
-            booking_payload,
+            bookingPayload,
         )
-        rooms_future = executor.submit(
-            request_json,
+        roomsFuture = executor.submit(
+            requestJson,
             "POST",
             f"{roomsService}/rooms/update",
-            room_update_payload,
+            roomUpdatePayload,
         )
 
-        bookings_status, bookings_data = bookings_future.result()
-        rooms_status, rooms_data = rooms_future.result()
+        bookingsStatus, bookingsData = bookingsFuture.result()
+        roomsStatus, roomsData = roomsFuture.result()
 
-    if bookings_status >= 400 or rooms_status >= 400:
+    if bookingsStatus >= 400 or roomsStatus >= 400:
         return jsonify({
             "error": "Card settlement succeeded but booking finalization failed",
-            "payment": settle_data,
-            "bookings": {"statusCode": bookings_status, "data": bookings_data},
-            "rooms": {"statusCode": rooms_status, "data": rooms_data},
+            "payment": settleData,
+            "bookings": {"statusCode": bookingsStatus, "data": bookingsData},
+            "rooms": {"statusCode": roomsStatus, "data": roomsData},
         }), 502
 
-    loyalty_publish_error = None
+    loyaltyPublishError = None
     try:
-        amount_for_loyalty = int(float(booking_payload["amountSpent"]))
-        points = amount_for_loyalty // 10
-        loyalty_event = {
+        amountForLoyalty = int(float(bookingPayload["amountSpent"]))
+        points = amountForLoyalty // 10
+        loyaltyEvent = {
             "event": "booking_paid",
-            "email": booking_payload["customerEmail"],
-            "bookingId": str(booking_id),
-            "amount": amount_for_loyalty,
+            "email": bookingPayload["customerEmail"],
+            "bookingId": str(bookingId),
+            "amount": amountForLoyalty,
         }
-        get_redis_client().xadd(redisStream, {"data": json.dumps(loyalty_event)})
+        getRedisClient().xadd(redisStream, {"data": json.dumps(loyaltyEvent)})
     except Exception as exc:
         points = None
-        loyalty_publish_error = str(exc)
+        loyaltyPublishError = str(exc)
 
-    pendingCardBookings.pop(str(hold_id), None)
+    pendingCardBookings.pop(str(holdId), None)
 
     return jsonify({
         "message": "Card settled and booking finalized successfully",
-        "payment": settle_data,
-        "booking": bookings_data,
-        "room": rooms_data,
+        "payment": settleData,
+        "booking": bookingsData,
+        "room": roomsData,
         "loyalty": {
             "event": "booking_paid",
-            "email": booking_payload["customerEmail"],
+            "email": bookingPayload["customerEmail"],
             "points": points,
-            "publishError": loyalty_publish_error,
+            "publishError": loyaltyPublishError,
         },
         "autoBookingCreated": True,
     }), 200
@@ -1690,7 +1926,7 @@ def routeRoomsCreateHold():
     if not roomType or not checkIn or not checkOut:
         return jsonify({"error": "roomType, checkIn and checkOut are required"}), 400
 
-    hold_status, hold_data = request_json("POST", f"{roomsService}/rooms/holds", payload)
+    hold_status, hold_data = requestJson("POST", f"{roomsService}/rooms/holds", payload)
 
     if hold_status < 400 and isinstance(hold_data, dict):
         hold_id = hold_data.get("holdId")
@@ -1775,6 +2011,52 @@ def routeRoomsUpdateReservation():
     return forward("POST", f"{roomsService}/rooms/update-reservation")
 
 
+@app.get("/route-loyalty/my-points")
+def routeLoyaltyMyPoints():
+    """
+    Return a simple loyalty points summary for the authenticated user.
+    """
+    unauthorized = checkAuth()
+    if unauthorized:
+        return unauthorized
+
+    user = getUser() or {}
+    user_identifier = (user.get("email") or user.get("username") or "").strip()
+    if not user_identifier:
+        return jsonify({"error": "Authenticated user missing email/username"}), 400
+
+    status_code, bookings_data = requestJson(
+        "GET",
+        f"{bookingsService}/bookings",
+        params={"customerEmail": user_identifier},
+    )
+    if status_code >= 400:
+        return jsonify({
+            "error": "Failed to fetch bookings for loyalty summary",
+            "bookings": {"statusCode": status_code, "data": bookings_data},
+        }), status_code
+
+    if not isinstance(bookings_data, list):
+        return jsonify({"error": "Unexpected bookings payload for loyalty summary"}), 502
+
+    total_spent = 0
+    for booking in bookings_data:
+        if not isinstance(booking, dict):
+            continue
+        amount_raw = booking.get("amount_spent") or booking.get("amountSpent") or 0
+        try:
+            total_spent += int(float(amount_raw))
+        except (TypeError, ValueError):
+            continue
+
+    return jsonify({
+        "email": user_identifier,
+        "bookingCount": len(bookings_data),
+        "totalSpent": total_spent,
+        "loyaltyPoints": total_spent // 10,
+    }), 200
+
+
 @app.post("/route-loyalty/add-points")
 def routeLoyaltyAddPoints():
     """
@@ -1791,7 +2073,7 @@ def routeLoyaltyAddPoints():
     if not email or points is None:
         return jsonify({"error": "email and points are required"}), 400
 
-    get_redis_client().xadd(
+    getRedisClient().xadd(
         redisStream,
         {
             "event": "add_points",
@@ -1819,7 +2101,7 @@ def routeLoyaltyDeductPoints():
     if not email or points is None:
         return jsonify({"error": "email and points are required"}), 400
 
-    get_redis_client().xadd(
+    getRedisClient().xadd(
         redisStream,
         {
             "event": "deduct_points",
@@ -1830,6 +2112,6 @@ def routeLoyaltyDeductPoints():
 
     return jsonify({"status": "queued", "event": "deduct_points"}), 202
 
-# Add flask in built threading to handle multiple requests, no point for kong imo with added latency
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, threaded=True)

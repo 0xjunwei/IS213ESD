@@ -371,6 +371,28 @@ def get_total_paid_refunds_for_payment(payment_id):
     return Decimal(str(row[0] or 0))
 
 
+def get_refund_capacity_for_hold(hold_id):
+    """Return refundable balance for latest paid payment of a hold."""
+    payment = get_latest_paid_payment_by_hold(hold_id)
+    if not payment:
+        return None
+
+    original_amount = Decimal(str(payment["amount"]))
+    total_refunded = get_total_paid_refunds_for_payment(payment["payment_id"])
+    remaining_refundable = original_amount - total_refunded
+    if remaining_refundable < 0:
+        remaining_refundable = Decimal("0")
+
+    return {
+        "paymentId": payment["payment_id"],
+        "holdId": hold_id,
+        "paymentMethod": payment.get("payment_method"),
+        "originalAmount": str(original_amount),
+        "alreadyRefunded": str(total_refunded),
+        "remainingRefundable": str(remaining_refundable),
+    }
+
+
 def create_refund_record(
     refund_intent_id,
     payment_id,
@@ -778,6 +800,20 @@ def refund_payment():
         paymentMethod=payment_method,
         remainingRefundable=str(remaining_refundable - refund_amount),
     ), 200
+
+
+@app.get("/payments/refund-capacity/<hold_id>")
+def get_refund_capacity(hold_id):
+    """Expose refundable balance for a holdId."""
+    hold_id = (hold_id or "").strip()
+    if not hold_id:
+        return jsonify(error="holdId is required"), 400
+
+    capacity = get_refund_capacity_for_hold(hold_id)
+    if not capacity:
+        return jsonify(error="no paid payment found", holdId=hold_id), 404
+
+    return jsonify(capacity), 200
 
 
 @app.get("/payments/<intent_id>")

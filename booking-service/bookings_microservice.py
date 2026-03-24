@@ -38,12 +38,14 @@ def init_db():
         check_in TIMESTAMP NOT NULL,
         check_out TIMESTAMP NOT NULL,
         amount_spent INT NOT NULL,
-        hold_id VARCHAR(100)
+        hold_id VARCHAR(100),
+        legacy_hold_id VARCHAR(100)
     )
     """
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(create_table_sql)
+
     conn.commit()
     cursor.close()
     conn.close()
@@ -137,8 +139,19 @@ def create_booking():
 
         insert_sql = """
         INSERT INTO bookings
-        (id, room_id, room_type, customer_email, customer_mobile, check_in, check_out, amount_spent, hold_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        (
+            id,
+            room_id,
+            room_type,
+            customer_email,
+            customer_mobile,
+            check_in,
+            check_out,
+            amount_spent,
+            hold_id,
+            legacy_hold_id
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
 
         values = (
@@ -150,7 +163,8 @@ def create_booking():
             data["checkIn"],
             data["checkOut"],
             data["amountSpent"],
-            data["holdId"]
+            data["holdId"],
+            data.get("legacyHoldId")
         )
 
         cursor.execute(insert_sql, values)
