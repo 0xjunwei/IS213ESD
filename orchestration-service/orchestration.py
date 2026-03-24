@@ -1830,6 +1830,6 @@ def routeLoyaltyDeductPoints():
 
     return jsonify({"status": "queued", "event": "deduct_points"}), 202
 
-
+# Add flask in built threading to handle multiple requests, no point for kong imo with added latency
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, threaded=True)
