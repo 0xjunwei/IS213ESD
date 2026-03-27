@@ -1,15 +1,17 @@
 from flask import Flask, render_template
 import redis
 import json
-
-app = Flask(__name__)
 import os
 
+app = Flask(__name__)
+
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 redis_client = redis.Redis(
-    host=os.getenv("REDIS_HOST", "redis"),
-    port=int(os.getenv("REDIS_PORT", 6379)),
+    host=REDIS_HOST,
+    port=6379,
     decode_responses=True,
 )
+
 DEAD_STREAM = "dead_letter_stream"
 
 
@@ -93,4 +95,4 @@ def dashboard():
 # ENTRY POINT
 # =========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    app.run(host='0.0.0.0', port=5001, debug=True)
