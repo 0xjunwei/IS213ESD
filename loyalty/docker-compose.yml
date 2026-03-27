@@ -1,22 +1,26 @@
+version: '3.8'
+
 services:
   redis:
     image: redis:7
-    container_name: redis
-    ports:
-      - "6379:6379"
-    networks:
-      - my-shared-network
+    restart: always
 
   consumer:
     build: .
     command: python -u -m consumers.consumer
     environment:
       - PYTHONPATH=/app
+      - REDIS_HOST=redis
     depends_on:
       - redis
-    networks:
-      - my-shared-network
 
-networks:
-  my-shared-network:
-    external: true
+  analytics:
+    build: .
+    command: python -u analytics/analytics_api.py
+    ports:
+      - "5001:5001"
+    environment:
+      - PYTHONPATH=/app
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
