@@ -62,6 +62,10 @@ def wait_for_db(max_retries=20, delay=3):
             time.sleep(delay)
     raise RuntimeError("Could not connect to MySQL after multiple retries.")
 
+@app.route("/health")
+def health():
+    return {"status": "ok"}, 200
+
 
 #get the bookings
 @app.get("/bookings/<int:booking_id>")
