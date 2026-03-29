@@ -14,7 +14,9 @@ redis_client = redis.Redis(
 
 DEAD_STREAM = "dead_letter_stream"
 
-
+@app.route("/health")
+def health():
+    return {"status": "ok"}, 200
 # =========================
 # 🔥 AUTO INSIGHT FUNCTION
 # =========================
