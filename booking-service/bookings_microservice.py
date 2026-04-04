@@ -62,10 +62,6 @@ def wait_for_db(max_retries=20, delay=3):
             time.sleep(delay)
     raise RuntimeError("Could not connect to MySQL after multiple retries.")
 
-@app.route("/health")
-def health():
-    return {"status": "ok"}, 200
-
 
 #get the bookings
 @app.get("/bookings/<int:booking_id>")
@@ -217,11 +213,6 @@ def delete_booking(booking_id):
     except Error as e:
         return jsonify({"message": "Failed to delete booking", "error": str(e)}), 500
 
-if __name__ == "__main__":
-    wait_for_db()
-    init_db()
-    app.run(host="0.0.0.0", port=5000, debug=False)
-
 #updates booking
 @app.post("/bookings/update")
 def update_booking():
@@ -315,4 +306,6 @@ def update_booking():
         return jsonify({"message": "Failed to update booking", "error": str(e)}), 500
 
 if __name__ == '__main__':
+    wait_for_db()
+    init_db()
     app.run(host='0.0.0.0', port=5000, debug=True)
