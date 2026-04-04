@@ -63,6 +63,11 @@ def wait_for_db(max_retries=20, delay=3):
     raise RuntimeError("Could not connect to MySQL after multiple retries.")
 
 
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
 #get the bookings
 @app.get("/bookings/<int:booking_id>")
 def get_booking(booking_id):
