@@ -45,6 +45,21 @@ RESEND_API_KEY={redacted}
 RESEND_FROM_EMAIL={redacted}
 ```
 
+telebot .env file:
+```
+# Required
+TELEGRAM_BOT_TOKEN={redacted}
+OPENAI_API_KEY={redacted}
+# Optional
+OPENAI_MODEL=gpt-4o-mini
+ORCHESTRATOR_BASE={redacted}
+RPC_URL=https://sepolia.base.org
+TOKEN_CONTRACT=0xbbD47B1eAdb7513a08c26C68E2669f4FE3B7Eae7
+TOKEN_DECIMALS=6
+CHAIN_ID=84532
+REQUEST_TIMEOUT=20
+```
+
 Rooms Service creds was hard-coded into the docker-compose.yml, as it is internalized I have assessed the risk to be fine, would not overwrite others work based on this risk assessment.
 
 ## Microservices Coordinated
